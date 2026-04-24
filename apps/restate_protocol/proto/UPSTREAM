@@ -15,3 +15,17 @@ Refresh procedure:
   cp /tmp/svc-proto/dev/restate/service/*.proto                 ./dev/restate/service/
   cp /tmp/svc-proto/endpoint_manifest_schema.json               .
   cp /tmp/svc-proto/service-invocation-protocol.md              .
+
+Regenerate Elixir modules (requires `protoc` and the `protoc-gen-elixir`
+escript from `mix escript.install hex protobuf`). Run from repo root:
+
+  protoc \
+    --plugin=protoc-gen-elixir=$HOME/.mix/escripts/protoc-gen-elixir \
+    --elixir_out=apps/restate_protocol/lib/restate/protocol/generated \
+    --proto_path=apps/restate_protocol/proto \
+    apps/restate_protocol/proto/dev/restate/service/protocol.proto \
+    apps/restate_protocol/proto/dev/restate/service/discovery.proto
+
+Generated modules are namespaced `Dev.Restate.Service.Protocol.*` (matches
+the proto package). Use `alias Dev.Restate.Service.Protocol, as: Pb` in
+calling code.
