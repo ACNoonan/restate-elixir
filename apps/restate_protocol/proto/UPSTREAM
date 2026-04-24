@@ -1,0 +1,17 @@
+Vendored from https://github.com/restatedev/service-protocol
+Branch: main (HEAD; the repo is archived — no `v3` tag exists)
+Commit: eaebc104834cf3405267ec180912b0e295340501
+Date:   2025-02-14
+Protocol version: V3 (ServiceProtocolVersion enum: V1, V2, V3)
+
+Files vendored as-is, no modifications:
+  dev/restate/service/protocol.proto       (513 lines)
+  dev/restate/service/discovery.proto       (24 lines)
+  endpoint_manifest_schema.json
+  service-invocation-protocol.md            (493 lines, reference spec)
+
+Refresh procedure:
+  git clone --depth 1 https://github.com/restatedev/service-protocol /tmp/svc-proto
+  cp /tmp/svc-proto/dev/restate/service/*.proto                 ./dev/restate/service/
+  cp /tmp/svc-proto/endpoint_manifest_schema.json               .
+  cp /tmp/svc-proto/service-invocation-protocol.md              .

@@ -1,0 +1,21 @@
+# Restate.Example.Greeter
+
+**TODO: Add description**
+
+## Installation
+
+If [available in Hex](https://hex.pm/docs/publish), the package can be installed
+by adding `restate_example_greeter` to your list of dependencies in `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:restate_example_greeter, "~> 0.1.0"}
+  ]
+end
+```
+
+Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
+and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
+be found at <https://hexdocs.pm/restate_example_greeter>.
+
