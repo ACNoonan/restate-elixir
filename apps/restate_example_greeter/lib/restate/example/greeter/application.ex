@@ -1,20 +1,22 @@
 defmodule Restate.Example.Greeter.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
 
   @impl true
   def start(_type, _args) do
-    children = [
-      # Starts a worker by calling: Restate.Example.Greeter.Worker.start_link(arg)
-      # {Restate.Example.Greeter.Worker, arg}
-    ]
+    Restate.Server.Registry.register_service(%{
+      name: "Greeter",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "count",
+          type: :exclusive,
+          mfa: {Restate.Example.Greeter, :count, 2}
+        }
+      ]
+    })
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
-    opts = [strategy: :one_for_one, name: Restate.Example.Greeter.Supervisor]
-    Supervisor.start_link(children, opts)
+    Supervisor.start_link([], strategy: :one_for_one, name: Restate.Example.Greeter.Supervisor)
   end
 end
