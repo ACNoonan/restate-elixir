@@ -21,8 +21,8 @@ defmodule Restate.Server.EndpointTest do
 
       manifest = Jason.decode!(conn.resp_body)
       assert manifest["protocolMode"] == "REQUEST_RESPONSE"
-      assert manifest["minProtocolVersion"] == 3
-      assert manifest["maxProtocolVersion"] == 3
+      assert manifest["minProtocolVersion"] == 5
+      assert manifest["maxProtocolVersion"] == 5
 
       assert [%{"name" => "Greeter", "ty" => "SERVICE", "handlers" => [%{"name" => "greet"}]}] =
                manifest["services"]
@@ -41,19 +41,23 @@ defmodule Restate.Server.EndpointTest do
       conn =
         :post
         |> conn("/invoke/Greeter/greet", body)
-        |> put_req_header("content-type", "application/vnd.restate.invocation.v3")
+        |> put_req_header("content-type", "application/vnd.restate.invocation.v5")
         |> Endpoint.call(@opts)
 
       assert conn.status == 200
 
       assert get_resp_header(conn, "content-type") == [
-               "application/vnd.restate.invocation.v3"
+               "application/vnd.restate.invocation.v5"
              ]
 
       assert {:ok, frames, ""} = Framer.decode_all(conn.resp_body)
 
       assert [
-               %Frame{message: %Pb.OutputEntryMessage{result: {:value, value_bytes}}},
+               %Frame{
+                 message: %Pb.OutputCommandMessage{
+                   result: {:value, %Pb.Value{content: value_bytes}}
+                 }
+               },
                %Frame{message: %Pb.EndMessage{}}
              ] = frames
 
@@ -88,7 +92,7 @@ defmodule Restate.Server.EndpointTest do
     name = Keyword.fetch!(opts, :name)
 
     start = %Pb.StartMessage{id: <<0, 1, 2, 3>>, debug_id: "test", known_entries: 1}
-    input = %Pb.InputEntryMessage{value: Jason.encode!(name)}
+    input = %Pb.InputCommandMessage{value: %Pb.Value{content: Jason.encode!(name)}}
 
     Framer.encode(start) <> Framer.encode(input)
   end

@@ -1,30 +1,33 @@
-Vendored from https://github.com/restatedev/service-protocol
-Branch: main (HEAD; the repo is archived — no `v3` tag exists)
-Commit: eaebc104834cf3405267ec180912b0e295340501
-Date:   2025-02-14
-Protocol version: V3 (ServiceProtocolVersion enum: V1, V2, V3)
+Vendored from https://github.com/restatedev/sdk-shared-core
+Path:   service-protocol/
+Commit: 66f6a3eda92adbfe855838b5ca42281c9afc58b1
+Date:   2026-04-13
+Protocol versions supported: V1..V6 (the SDK targets V5 for the MVP)
+
+V5+ ships protocol.proto only — discovery is JSON-only via
+endpoint_manifest_schema.json. There is no discovery.proto in V5.
 
 Files vendored as-is, no modifications:
-  dev/restate/service/protocol.proto       (513 lines)
-  dev/restate/service/discovery.proto       (24 lines)
+  dev/restate/service/protocol.proto       (671 lines)
   endpoint_manifest_schema.json
-  service-invocation-protocol.md            (493 lines, reference spec)
+  service-invocation-protocol.md           (reference spec)
 
 Refresh procedure:
-  git clone --depth 1 https://github.com/restatedev/service-protocol /tmp/svc-proto
-  cp /tmp/svc-proto/dev/restate/service/*.proto                 ./dev/restate/service/
-  cp /tmp/svc-proto/endpoint_manifest_schema.json               .
-  cp /tmp/svc-proto/service-invocation-protocol.md              .
+  git clone --depth 1 https://github.com/restatedev/sdk-shared-core /tmp/ssc
+  cp /tmp/ssc/service-protocol/dev/restate/service/protocol.proto  ./dev/restate/service/
+  cp /tmp/ssc/service-protocol/endpoint_manifest_schema.json       .
+  cp /tmp/ssc/service-protocol/service-invocation-protocol.md      .
 
 Regenerate Elixir modules (requires `protoc` and the `protoc-gen-elixir`
 escript from `mix escript.install hex protobuf`). Run from repo root:
 
+  rm -rf apps/restate_protocol/lib/restate/protocol/generated
+  mkdir -p apps/restate_protocol/lib/restate/protocol/generated
   protoc \
     --plugin=protoc-gen-elixir=$HOME/.mix/escripts/protoc-gen-elixir \
     --elixir_out=apps/restate_protocol/lib/restate/protocol/generated \
     --proto_path=apps/restate_protocol/proto \
-    apps/restate_protocol/proto/dev/restate/service/protocol.proto \
-    apps/restate_protocol/proto/dev/restate/service/discovery.proto
+    apps/restate_protocol/proto/dev/restate/service/protocol.proto
 
 Generated modules are namespaced `Dev.Restate.Service.Protocol.*` (matches
 the proto package). Use `alias Dev.Restate.Service.Protocol, as: Pb` in

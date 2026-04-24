@@ -1,6 +1,6 @@
 defmodule Restate.Protocol.Framer do
   @moduledoc """
-  8-byte header framer for the Restate V3 service protocol.
+  8-byte header framer for the Restate V5 service protocol.
 
   Header layout (big-endian):
 
@@ -32,7 +32,7 @@ defmodule Restate.Protocol.Framer do
   def encode(%mod{} = msg, flags \\ 0) do
     type =
       Messages.type_for_module(mod) ||
-        raise ArgumentError, "no V3 type ID for #{inspect(mod)}"
+        raise ArgumentError, "no V5 type ID for #{inspect(mod)}"
 
     body = Protobuf.encode(msg)
     <<type::16, flags::16, byte_size(body)::32, body::binary>>

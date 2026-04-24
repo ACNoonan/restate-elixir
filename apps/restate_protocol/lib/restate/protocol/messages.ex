@@ -1,44 +1,71 @@
 defmodule Restate.Protocol.Messages do
   @moduledoc """
-  V3 service-protocol message-type registry.
+  V5 service-protocol message-type registry.
 
   Maps the 16-bit on-the-wire type ID to the generated protobuf module and
-  back. IDs are pulled from the V3 spec table in
-  `proto/service-invocation-protocol.md` and cross-checked against
-  `sdk-java` v1.2.0 (the last release on the V3 line). The spec's State
-  entries table has a typo — SetState/ClearState/ClearAllState IDs are one
-  off; the values below match sdk-java and the wire format.
+  back. V5 partitions the 16-bit space into three namespaces:
+
+    * `0x0000` — control frames (Start/Suspension/Error/End/CommandAck/
+      ProposeRunCompletion)
+    * `0x0400` — Command messages (SDK → runtime journal entries)
+    * `0x8000` — Notification messages (runtime → SDK completions)
+
+  IDs are taken from the inline `Type:` comments in `protocol.proto` and
+  cross-checked against `sdk-java` HEAD's `MessageType.java`. Two values
+  the proto comments don't capture cleanly:
+
+    * `SendSignalCommandMessage = 0x0410` (proto comment has a stray `0`:
+      it reads `0x04000 + 10`; canonical is `0x0400 + 0x10`).
+    * `SignalNotificationMessage = 0xFBFF` (one below the custom-entry
+      range that starts at `0xFC00`).
   """
 
   alias Dev.Restate.Service.Protocol, as: Pb
 
   @type_to_module %{
+    # --- Control frames (0x0000 namespace) ---
     0x0000 => Pb.StartMessage,
-    0x0001 => Pb.CompletionMessage,
-    0x0002 => Pb.SuspensionMessage,
-    0x0003 => Pb.ErrorMessage,
-    0x0004 => Pb.EntryAckMessage,
-    0x0005 => Pb.EndMessage,
-    0x0400 => Pb.InputEntryMessage,
-    0x0401 => Pb.OutputEntryMessage,
-    0x0800 => Pb.GetStateEntryMessage,
-    0x0801 => Pb.SetStateEntryMessage,
-    0x0802 => Pb.ClearStateEntryMessage,
-    0x0803 => Pb.ClearAllStateEntryMessage,
-    0x0804 => Pb.GetStateKeysEntryMessage,
-    0x0808 => Pb.GetPromiseEntryMessage,
-    0x0809 => Pb.PeekPromiseEntryMessage,
-    0x080A => Pb.CompletePromiseEntryMessage,
-    0x0C00 => Pb.SleepEntryMessage,
-    0x0C01 => Pb.CallEntryMessage,
-    0x0C02 => Pb.OneWayCallEntryMessage,
-    0x0C03 => Pb.AwakeableEntryMessage,
-    0x0C04 => Pb.CompleteAwakeableEntryMessage,
-    0x0C05 => Pb.RunEntryMessage,
-    0x0C06 => Pb.CancelInvocationEntryMessage,
-    0x0C07 => Pb.GetCallInvocationIdEntryMessage,
-    0x0C08 => Pb.AttachInvocationEntryMessage,
-    0x0C09 => Pb.GetInvocationOutputEntryMessage
+    0x0001 => Pb.SuspensionMessage,
+    0x0002 => Pb.ErrorMessage,
+    0x0003 => Pb.EndMessage,
+    0x0004 => Pb.CommandAckMessage,
+    0x0005 => Pb.ProposeRunCompletionMessage,
+
+    # --- Commands (0x0400 namespace) ---
+    0x0400 => Pb.InputCommandMessage,
+    0x0401 => Pb.OutputCommandMessage,
+    0x0402 => Pb.GetLazyStateCommandMessage,
+    0x0403 => Pb.SetStateCommandMessage,
+    0x0404 => Pb.ClearStateCommandMessage,
+    0x0405 => Pb.ClearAllStateCommandMessage,
+    0x0406 => Pb.GetLazyStateKeysCommandMessage,
+    0x0407 => Pb.GetEagerStateCommandMessage,
+    0x0408 => Pb.GetEagerStateKeysCommandMessage,
+    0x0409 => Pb.GetPromiseCommandMessage,
+    0x040A => Pb.PeekPromiseCommandMessage,
+    0x040B => Pb.CompletePromiseCommandMessage,
+    0x040C => Pb.SleepCommandMessage,
+    0x040D => Pb.CallCommandMessage,
+    0x040E => Pb.OneWayCallCommandMessage,
+    0x0410 => Pb.SendSignalCommandMessage,
+    0x0411 => Pb.RunCommandMessage,
+    0x0412 => Pb.AttachInvocationCommandMessage,
+    0x0413 => Pb.GetInvocationOutputCommandMessage,
+    0x0414 => Pb.CompleteAwakeableCommandMessage,
+
+    # --- Notifications (0x8000 namespace) ---
+    0x8002 => Pb.GetLazyStateCompletionNotificationMessage,
+    0x8006 => Pb.GetLazyStateKeysCompletionNotificationMessage,
+    0x8009 => Pb.GetPromiseCompletionNotificationMessage,
+    0x800A => Pb.PeekPromiseCompletionNotificationMessage,
+    0x800B => Pb.CompletePromiseCompletionNotificationMessage,
+    0x800C => Pb.SleepCompletionNotificationMessage,
+    0x800D => Pb.CallCompletionNotificationMessage,
+    0x800E => Pb.CallInvocationIdCompletionNotificationMessage,
+    0x8011 => Pb.RunCompletionNotificationMessage,
+    0x8012 => Pb.AttachInvocationCompletionNotificationMessage,
+    0x8013 => Pb.GetInvocationOutputCompletionNotificationMessage,
+    0xFBFF => Pb.SignalNotificationMessage
   }
 
   @module_to_type Map.new(@type_to_module, fn {type, mod} -> {mod, type} end)

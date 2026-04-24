@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: pre-alpha, active development.** Greenfield project started 2026-04-24. Targeting Restate service protocol V3 for the initial MVP. No Hex release yet.
+> **Status: pre-alpha, active development.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (current; works against `restate-server` 1.6.2). No Hex release yet.
 
 ## Why this exists
 
@@ -16,16 +16,16 @@ Teams **already running Restate services** in TypeScript, Java, or Go who want t
 
 ## What's in scope for the MVP
 
-- Restate service protocol V3 (~20 journal entries + 6 control frames)
+- Restate service protocol **V5** (current; ~37 message types across control / Command / Notification namespaces)
 - **Service** type (stateless handlers)
 - **Virtual Object** type (keyed stateful handlers with serialized concurrency per key)
-- Journaled primitives: `get_state`, `set_state`, `sleep`, `call`, `run`, `awakeable`
+- Journaled primitives: `get_state` (eager), `set_state`, `sleep`, `call`, `run`, `awakeable`
 - HTTP/2 endpoint via Bandit
 - Discovery manifest at `GET /discover`
 - Conformance subset from [restatedev/sdk-test-suite](https://github.com/restatedev/sdk-test-suite)
 - Local K8s (`kind`) as the durability test bed
 
-**Explicitly deferred** to v0.2+: **Workflow** service type (lifecycle + versioning complexity), V4/V5 protocol, Lambda transport, production hardening.
+**Explicitly deferred** to v0.2+: **Workflow** service type (lifecycle + versioning complexity), V6 protocol, Lambda transport, lazy state, production hardening.
 
 See [PLAN.md](./PLAN.md) for the week-by-week scope.
 
@@ -34,15 +34,12 @@ See [PLAN.md](./PLAN.md) for the week-by-week scope.
 Requires Docker and the `restate` CLI.
 
 ```sh
-docker compose up -d                                     # restate 1.4.4 + elixir handler
+docker compose up -d                                     # restate 1.6.2 + elixir handler
 restate --yes deployments register http://elixir-handler:9080
 curl -sS -X POST http://localhost:8080/Greeter/greet \
   -H 'content-type: application/json' -d '"world"'
 # → "hello"
 ```
-
-> **restate-server is pinned to 1.4.4** because V3 was removed in 1.5.0+.
-> Migrating to V5/V6 (the current protocol) is a v0.2 milestone.
 
 ## Status at a glance
 
@@ -53,7 +50,7 @@ curl -sS -X POST http://localhost:8080/Greeter/greet \
 | State machine (`:gen_statem`) | — |
 | Context API (`get_state`/`set_state`/`sleep`/...) | — |
 | Example handler (`Greeter`) | ✓ non-durable echo |
-| `docker-compose` dev loop | ✓ pinned to `restate:1.4.4` |
+| `docker-compose` dev loop | ✓ against `restate:1.6.2` |
 | `kind` cluster test bed | — |
 | Conformance against `sdk-test-suite` | — |
 | Durability demo (pod kill mid-sleep) | — |

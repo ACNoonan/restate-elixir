@@ -1,6 +1,6 @@
 defmodule Restate.Server.Endpoint do
   @moduledoc """
-  Plug router serving the V3 service-protocol HTTP surface.
+  Plug router serving the V5 service-protocol HTTP surface.
 
   Two routes for Week 1:
 
@@ -8,7 +8,7 @@ defmodule Restate.Server.Endpoint do
       says `/discovery` but live restate-server hits `/discover` — verified
       against restate:latest in Apr 2026.)
     * `POST /invoke/:service/:handler` — non-durable echo. Reads the framed
-      request body and replies with `OutputEntryMessage("hello")` +
+      request body and replies with `OutputCommandMessage("hello")` +
       `EndMessage`. No journal logic yet — that arrives in Week 2.
   """
 
@@ -19,7 +19,7 @@ defmodule Restate.Server.Endpoint do
   alias Restate.Server.Manifest
 
   @discovery_content_type "application/vnd.restate.endpointmanifest.v2+json"
-  @invocation_content_type "application/vnd.restate.invocation.v3"
+  @invocation_content_type "application/vnd.restate.invocation.v5"
   @sdk_id "restate-sdk-elixir/0.1.0"
 
   # Hardcoded for the Week 1 echo. A real registry comes in Week 2.
@@ -50,9 +50,11 @@ defmodule Restate.Server.Endpoint do
 
         case Framer.decode_all(body) do
           {:ok, _frames, _leftover} ->
-            response =
-              Framer.encode(%Pb.OutputEntryMessage{result: {:value, Jason.encode!("hello")}}) <>
-                Framer.encode(%Pb.EndMessage{})
+            output = %Pb.OutputCommandMessage{
+              result: {:value, %Pb.Value{content: Jason.encode!("hello")}}
+            }
+
+            response = Framer.encode(output) <> Framer.encode(%Pb.EndMessage{})
 
             conn
             |> put_resp_header("content-type", @invocation_content_type)

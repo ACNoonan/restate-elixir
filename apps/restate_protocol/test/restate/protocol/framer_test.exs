@@ -5,20 +5,20 @@ defmodule Restate.Protocol.FramerTest do
   alias Restate.Protocol.{Frame, Framer, Messages}
 
   describe "header layout" do
-    test "EndMessage encodes to type=0x0005, flags=0, length=0" do
+    test "EndMessage encodes to type=0x0003, flags=0, length=0" do
       # EndMessage has no fields; protobuf body is empty.
       bytes = Framer.encode(%Pb.EndMessage{})
-      assert <<0x0005::16, 0::16, 0::32>> == bytes
+      assert <<0x0003::16, 0::16, 0::32>> == bytes
       assert byte_size(bytes) == 8
     end
 
     test "explicit flags propagate into the header" do
       bytes = Framer.encode(%Pb.EndMessage{}, 0xABCD)
-      assert <<0x0005::16, 0xABCD::16, 0::32>> == bytes
+      assert <<0x0003::16, 0xABCD::16, 0::32>> == bytes
     end
 
     test "encode raises for an unregistered module" do
-      assert_raise ArgumentError, ~r/no V3 type ID/, fn ->
+      assert_raise ArgumentError, ~r/no V5 type ID/, fn ->
         Framer.encode(%Pb.StartMessage.StateEntry{key: "k", value: "v"})
       end
     end
@@ -61,7 +61,7 @@ defmodule Restate.Protocol.FramerTest do
 
     test "extra bytes past one frame are returned as rest" do
       one = Framer.encode(%Pb.EndMessage{})
-      assert {:ok, %Frame{type: 0x0005}, "tail"} = Framer.decode(one <> "tail")
+      assert {:ok, %Frame{type: 0x0003}, "tail"} = Framer.decode(one <> "tail")
     end
   end
 
