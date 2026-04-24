@@ -6,7 +6,7 @@ Week-by-week engineering plan for the initial 4-week MVP. Scope deliberately nar
 
 ### In
 
-- Restate **service protocol V3** (archived but still accepted by current Restate servers; ~20 journal entries + 6 control frames; cleaner spec than current V4/V5 command/notification split)
+- Restate **service protocol V3** (~20 journal entries + 6 control frames; cleaner spec than current V4/V5 command/notification split). **Note: V3 was removed in `restate-server` 1.5.0 (Sep 2025); the MVP demo pins `restate-server` to 1.4.4. Migrating the SDK to V5/V6 is the v0.2 milestone.**
 - **Service** type (stateless handlers)
 - **Virtual Object** type (keyed stateful handlers with serialized concurrency per key)
 - Journaled primitives: `get_state`, `set_state`, `sleep`, `call`, `run`, `awakeable`
@@ -57,7 +57,7 @@ Goal: an Elixir handler that responds to Restate invocations end-to-end in `dock
 - Hand-write the 8-byte message framer/deframer (~100 LOC; see `sdk-java/sdk-core/.../MessageEncoder.java` + `MessageDecoder.java`)
 - Bandit serving `GET /discover` with a minimal service manifest (one service `Greeter`, one handler `greet`)
 - Bandit serving `POST /invoke/Greeter/greet` that parses `StartMessage`, immediately sends `OutputMessage { "hello" }` + `EndMessage` — **no journal logic yet**, this is a non-durable echo
-- `docker-compose.yml` with `restate-server` + Elixir app; register via `restate registrations register http://elixir-handler:9080`
+- `docker-compose.yml` with `restate-server` + Elixir app; register via `restate deployments register http://elixir-handler:9080`
 
 **Deliverable:** `restate invocations invoke Greeter/greet` returns `"hello"`. The wire format works.
 
@@ -121,7 +121,7 @@ Plan: reach out after Week 4 with working code and a recorded demo. Frame should
 ## Known risks
 
 1. **Bandit HTTP/2 full-duplex streaming** is the single biggest unknown. Plug's model is request-then-response; Restate assumes interleaved frames on one stream. Fallback: **request/response mode** — works for the Week 3 demo (sleep suspension + re-invocation); loses the same-stream suspend/resume optimization. **Don't spend >3 days fighting Bandit before considering the fallback.**
-2. **V3 → V4/V5 drift.** Targeting V3 is safe for MVP; production parity eventually requires V5. Don't get lured mid-way into porting V5 (adds 4–6 weeks and derails the scope).
+2. **V3 → V4/V5 drift.** V3 was removed in `restate-server` 1.5.0 (verified Apr 2026: registering a V3 manifest against 1.5+ returns `META0012 unsupported service protocol versions: [3, 3]. Supported versions by this runtime are [5, 6]`). MVP demo pins to `restate:1.4.4`; production parity requires V5/V6 and is the v0.2 milestone. Don't get lured mid-way into porting V5 (adds 4–6 weeks and derails the scope).
 3. **Suspension semantics subtlety.** "When to suspend" (no more work to do *and* waiting on an uncompleted completable entry) has edge cases that look fine until a crash-recovery test fails. The `sdk-test-suite` is the safety net — run it early in Week 4.
 4. **NIF shortcut temptation.** Wrapping `sdk-shared-core` via Rustler would be ~1–2 weeks but NIF panics crash the BEAM scheduler — directly contradicts the "BEAM-native durability" story that justifies the SDK existing. Off the table for v0.1; revisit as a production-hardening option only once the pure-Elixir SDK exists.
 

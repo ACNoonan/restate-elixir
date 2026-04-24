@@ -29,16 +29,31 @@ Teams **already running Restate services** in TypeScript, Java, or Go who want t
 
 See [PLAN.md](./PLAN.md) for the week-by-week scope.
 
+## Quickstart
+
+Requires Docker and the `restate` CLI.
+
+```sh
+docker compose up -d                                     # restate 1.4.4 + elixir handler
+restate --yes deployments register http://elixir-handler:9080
+curl -sS -X POST http://localhost:8080/Greeter/greet \
+  -H 'content-type: application/json' -d '"world"'
+# → "hello"
+```
+
+> **restate-server is pinned to 1.4.4** because V3 was removed in 1.5.0+.
+> Migrating to V5/V6 (the current protocol) is a v0.2 milestone.
+
 ## Status at a glance
 
 | Area | State |
 |---|---|
-| Protocol framing | — |
-| Discovery manifest | — |
+| Protocol framing | ✓ encode/decode + 11 unit tests |
+| Discovery manifest | ✓ `GET /discover` (REQUEST_RESPONSE, V3) |
 | State machine (`:gen_statem`) | — |
 | Context API (`get_state`/`set_state`/`sleep`/...) | — |
-| Example handler (`Greeter`) | — |
-| `docker-compose` dev loop | — |
+| Example handler (`Greeter`) | ✓ non-durable echo |
+| `docker-compose` dev loop | ✓ pinned to `restate:1.4.4` |
 | `kind` cluster test bed | — |
 | Conformance against `sdk-test-suite` | — |
 | Durability demo (pod kill mid-sleep) | — |

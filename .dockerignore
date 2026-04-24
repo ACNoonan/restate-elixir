@@ -1,0 +1,11 @@
+_build
+deps
+cover
+doc
+.git
+.elixir_ls
+.formatter.exs
+.idea
+.vscode
+*.swp
+.DS_Store

@@ -9,9 +9,9 @@ defmodule Restate.Server.EndpointTest do
 
   @opts Endpoint.init([])
 
-  describe "GET /discovery" do
+  describe "GET /discover" do
     test "returns the manifest with content-type vnd.restate.endpointmanifest.v2+json" do
-      conn = :get |> conn("/discovery") |> Endpoint.call(@opts)
+      conn = :get |> conn("/discover") |> Endpoint.call(@opts)
 
       assert conn.status == 200
 
@@ -29,7 +29,7 @@ defmodule Restate.Server.EndpointTest do
     end
 
     test "advertises the SDK via x-restate-server" do
-      conn = :get |> conn("/discovery") |> Endpoint.call(@opts)
+      conn = :get |> conn("/discover") |> Endpoint.call(@opts)
       assert ["restate-sdk-elixir/0.1.0"] = get_resp_header(conn, "x-restate-server")
     end
   end

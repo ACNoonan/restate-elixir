@@ -1,0 +1,20 @@
+# Pinned to restate 1.4.4 — the last release that accepts service-protocol V3.
+# 1.5.0+ removed V3 support; jumping to V5/V6 is v0.2 scope (see PLAN.md).
+services:
+  restate:
+    image: docker.restate.dev/restatedev/restate:1.4.4
+    ports:
+      - "8080:8080"  # ingress (curl POST /Greeter/greet here)
+      - "9070:9070"  # admin (restate CLI talks to this)
+      - "9071:9071"  # node-to-node
+    networks:
+      - restate-net
+
+  elixir-handler:
+    build: .
+    networks:
+      - restate-net
+
+networks:
+  restate-net:
+    driver: bridge

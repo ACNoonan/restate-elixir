@@ -4,7 +4,9 @@ defmodule Restate.Server.Endpoint do
 
   Two routes for Week 1:
 
-    * `GET /discovery` — returns the endpoint manifest as JSON.
+    * `GET /discover` — returns the endpoint manifest as JSON. (Spec doc
+      says `/discovery` but live restate-server hits `/discover` — verified
+      against restate:latest in Apr 2026.)
     * `POST /invoke/:service/:handler` — non-durable echo. Reads the framed
       request body and replies with `OutputEntryMessage("hello")` +
       `EndMessage`. No journal logic yet — that arrives in Week 2.
@@ -25,10 +27,11 @@ defmodule Restate.Server.Endpoint do
     %{name: "Greeter", ty: "SERVICE", handlers: [%{name: "greet"}]}
   ]
 
+  plug Plug.Logger, log: :info
   plug :match
   plug :dispatch
 
-  get "/discovery" do
+  get "/discover" do
     body = @services |> Manifest.build() |> Jason.encode!()
 
     conn
