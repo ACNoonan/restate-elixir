@@ -25,7 +25,10 @@ defmodule Restate.Server.MixProject do
 
   defp deps do
     [
-      {:restate_protocol, in_umbrella: true}
+      {:restate_protocol, in_umbrella: true},
+      {:bandit, "~> 1.5"},
+      {:plug, "~> 1.16"},
+      {:jason, "~> 1.4"}
     ]
   end
 end

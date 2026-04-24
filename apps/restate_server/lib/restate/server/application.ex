@@ -1,19 +1,16 @@
 defmodule Restate.Server.Application do
-  # See https://hexdocs.pm/elixir/Application.html
-  # for more information on OTP Applications
   @moduledoc false
 
   use Application
 
   @impl true
   def start(_type, _args) do
+    port = Application.get_env(:restate_server, :port, 9080)
+
     children = [
-      # Starts a worker by calling: Restate.Server.Worker.start_link(arg)
-      # {Restate.Server.Worker, arg}
+      {Bandit, plug: Restate.Server.Endpoint, port: port}
     ]
 
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Restate.Server.Supervisor]
     Supervisor.start_link(children, opts)
   end
