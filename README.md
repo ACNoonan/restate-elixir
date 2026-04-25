@@ -31,27 +31,64 @@ See [PLAN.md](./PLAN.md) for the week-by-week scope.
 
 ## Quickstart
 
+### docker-compose
+
 Requires Docker and the `restate` CLI.
 
 ```sh
 docker compose up -d                                     # restate 1.6.2 + elixir handler
 restate --yes deployments register http://elixir-handler:9080
-curl -sS -X POST http://localhost:8080/Greeter/greet \
-  -H 'content-type: application/json' -d '"world"'
-# → "hello"
+curl -sS -X POST http://localhost:8080/Greeter/world/count \
+  -H 'content-type: application/json' -d 'null'
+# → "hello 1"  (run again → "hello 2", state lives in Restate)
 ```
+
+### kind (single-node K8s)
+
+Requires `docker`, `kind`, `kubectl`, and the `restate` CLI.
+
+```sh
+# 1. Build and load the handler image into the kind node
+docker compose build elixir-handler
+docker tag restate-elixir-elixir-handler:latest restate-elixir-handler:0.1.0
+kind create cluster --name restate-elixir --config k8s/kind-config.yaml
+kind load docker-image restate-elixir-handler:0.1.0 --name restate-elixir
+
+# 2. Deploy restate-server, the handler, and run the registration Job
+kubectl apply -f k8s/restate.yaml
+kubectl rollout status statefulset/restate -n restate
+kubectl apply -f k8s/elixir-handler.yaml
+kubectl rollout status deployment/elixir-handler
+kubectl apply -f k8s/register.yaml
+kubectl wait --for=condition=complete --timeout=60s job/register-elixir-handler
+
+# 3. Invoke (NodePort 30080 maps to host :8080 via the kind config)
+curl -sS -X POST http://localhost:8080/Greeter/world/count \
+  -H 'content-type: application/json' -d 'null'
+# → "hello 1"
+```
+
+> Restate persists state across pod restarts: `kubectl delete pod -l
+> app=elixir-handler` and re-curl — the counter keeps incrementing from
+> wherever it left off. Suspending mid-invocation across pod kills lands
+> in Week 3.
+
+In production, prefer the official Helm chart (`helm install restate
+restate/restate`) over the bundled `k8s/restate.yaml`; the local manifest
+is a single-node `emptyDir` setup intended only for the demo.
 
 ## Status at a glance
 
 | Area | State |
 |---|---|
 | Protocol framing | ✓ encode/decode + 11 unit tests |
-| Discovery manifest | ✓ `GET /discover` (REQUEST_RESPONSE, V3) |
-| State machine (`:gen_statem`) | — |
-| Context API (`get_state`/`set_state`/`sleep`/...) | — |
-| Example handler (`Greeter`) | ✓ non-durable echo |
+| Discovery manifest | ✓ `GET /discover` (REQUEST_RESPONSE, V5) |
+| Context API (`get_state` / `set_state`) | ✓ eager state |
+| Context API (`sleep` / `call` / `awakeable` / `run`) | — |
+| Example handler (`Greeter` counter Virtual Object) | ✓ persists across pod restarts |
 | `docker-compose` dev loop | ✓ against `restate:1.6.2` |
-| `kind` cluster test bed | — |
+| `kind` cluster test bed | ✓ self-contained manifests in `k8s/` |
+| Full `:gen_statem` replay/processing FSM | — (Week 3) |
 | Conformance against `sdk-test-suite` | — |
 | Durability demo (pod kill mid-sleep) | — |
 

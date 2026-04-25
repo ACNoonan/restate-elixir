@@ -1,0 +1,27 @@
+# One-shot Job: registers the Elixir handler with Restate's admin API.
+# Uses curl + the admin REST API directly — much simpler than configuring
+# the restate CLI's environment abstraction inside a container.
+#
+# Re-running after the handler is reachable is safe — Restate de-dupes
+# by URL and silently no-ops the second registration.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: register-elixir-handler
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: register
+          image: curlimages/curl:8.10.1
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              curl -fsS -X POST \
+                http://restate.restate.svc.cluster.local:9070/deployments \
+                -H 'content-type: application/json' \
+                -d '{"uri": "http://elixir-handler.default.svc.cluster.local:9080"}'

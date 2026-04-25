@@ -61,7 +61,7 @@ Goal: an Elixir handler that responds to Restate invocations end-to-end in `dock
 
 **Deliverable:** `curl POST .../Greeter/greet '"world"'` returns `"hello"`. The wire format works.
 
-### Week 2 — State primitives + first `kind` deploy
+### Week 2 — State primitives + first `kind` deploy ✓
 
 Goal: real journal for `get_state` / `set_state`, running in a local K8s cluster.
 

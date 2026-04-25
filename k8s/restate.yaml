@@ -1,0 +1,72 @@
+# Self-contained restate-server manifest for the Week 2 kind demo.
+#
+# emptyDir volume for state — fine for a single-node test bed; for any
+# real deployment use the official Helm chart with persistent storage:
+#   helm install restate restate/restate
+#
+# NodePorts 30080 (ingress) and 30070 (admin) are mapped to host
+# 8080/9070 by the kind config (k8s/kind-config.yaml).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: restate
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: restate
+  namespace: restate
+spec:
+  serviceName: restate-headless
+  replicas: 1
+  selector:
+    matchLabels: { app: restate }
+  template:
+    metadata:
+      labels: { app: restate }
+    spec:
+      containers:
+        - name: restate
+          image: docker.restate.dev/restatedev/restate:1.6.2
+          ports:
+            - { name: ingress,   containerPort: 8080 }
+            - { name: admin,     containerPort: 9070 }
+            - { name: node-node, containerPort: 9071 }
+          volumeMounts:
+            - { name: data, mountPath: /restate-data }
+          readinessProbe:
+            tcpSocket: { port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - { name: data, emptyDir: {} }
+---
+# Headless service — required by the StatefulSet spec, used by
+# in-cluster clients that want stable per-pod DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: restate-headless
+  namespace: restate
+spec:
+  clusterIP: None
+  selector: { app: restate }
+  ports:
+    - { name: ingress,   port: 8080 }
+    - { name: admin,     port: 9070 }
+    - { name: node-node, port: 9071 }
+---
+# NodePort service — exposes ingress + admin to the host through the kind
+# port-mappings configured in k8s/kind-config.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: restate
+  namespace: restate
+spec:
+  type: NodePort
+  selector: { app: restate }
+  ports:
+    - { name: ingress, port: 8080, targetPort: 8080, nodePort: 30080 }
+    - { name: admin,   port: 9070, targetPort: 9070, nodePort: 30070 }
