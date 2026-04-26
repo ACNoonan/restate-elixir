@@ -105,6 +105,61 @@ defmodule Restate.Server.InvocationTest do
     end
   end
 
+  describe "Restate.ProtocolError + related_command_*" do
+    defmodule MismatchedHandler do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.set_state(ctx, "k", "v")
+        :ok
+      end
+    end
+
+    defmodule TwoSetsThenBoom do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.set_state(ctx, "a", 1)
+        Context.set_state(ctx, "b", 2)
+        raise "boom"
+      end
+    end
+
+    test "journal mismatch (set_state vs recorded sleep) emits ErrorMessage{code: 570}" do
+      replay = [%Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0}]
+
+      assert [%Pb.ErrorMessage{} = err] =
+               run(%Pb.StartMessage{}, nil, {MismatchedHandler, :handle, 2}, replay)
+
+      assert err.code == 570
+      assert err.message =~ "journal mismatch"
+    end
+
+    test "journal exhausted (set_state, no recorded entries during replay) emits 570" do
+      # Force replay phase by including a notification (which alone won't put
+      # us in :replaying — only commands do — so we include a fake recorded
+      # SleepCommand to enter :replaying, then set_state mismatches against it).
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0}
+      ]
+
+      assert [%Pb.ErrorMessage{code: 570}] =
+               run(%Pb.StartMessage{}, nil, {MismatchedHandler, :handle, 2}, replay)
+    end
+
+    test "ErrorMessage carries related_command_index after the failing op" do
+      assert [
+               %Pb.SetStateCommandMessage{key: "a"},
+               %Pb.SetStateCommandMessage{key: "b"},
+               %Pb.ErrorMessage{} = err
+             ] = run(%Pb.StartMessage{}, nil, {TwoSetsThenBoom, :handle, 2})
+
+      # Two SetState commands processed (indexes 0 and 1) before raise.
+      assert err.related_command_index == 1
+      assert err.related_command_type == 0x0403
+    end
+  end
+
   describe "clear_state" do
     defmodule Clearer do
       alias Restate.Context

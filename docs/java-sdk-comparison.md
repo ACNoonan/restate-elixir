@@ -157,7 +157,7 @@ reflects the canonical Java values:
 |---|---|---|
 | Files | [`Framer.ex`](../apps/restate_protocol/lib/restate/protocol/framer.ex) (83) + [`Frame.ex`](../apps/restate_protocol/lib/restate/protocol/frame.ex) (19) | `MessageEncoder.java` (61) + `MessageDecoder.java` (130) + `MessageHeader.java` |
 | Approach | Pure functions: `encode/2`, `decode/1`, `decode_all/1` | Stateful classes; `MessageDecoder` has its own FSM (`WAITING_HEADER`/`WAITING_PAYLOAD`/`FAILED`) for byte-level streaming |
-| Header bits | Type + Flags + Length parsed; **flag bits not yet examined on decode** | Header object with explicit `requiresAck()` / `completed()` accessors |
+| Header bits | Type + Flags + Length parsed; flags stored on `Frame.flags` but not acted on | Identical: `MessageHeader.parse` stores flags as `int`, no `requiresAck()` / `completed()` accessor |
 
 The framing logic itself is identical (8-byte header: 16-bit type +
 16-bit flags + 32-bit length, big-endian). What differs is the
@@ -166,17 +166,16 @@ available to parse a header, then enough for a body, then loops.
 Elixir's `Framer.decode_all/1` takes a complete binary and walks it
 in one pass.
 
-**Gap to fix:** Java's `MessageHeader` exposes `requiresAck()` and
-`completed()` flag bits that drive replay logic for completable
-commands. Our `Frame.flags` field captures the raw 16-bit value but
-we don't act on it. For completable commands replayed from the
-journal, the `COMPLETED` bit (mask `0x0001`) tells us whether the
-result is already attached to the entry. Currently we infer
-"completed" from whether a matching `*CompletionNotificationMessage`
-appears in the replay journal — which works in practice for the
-SDK-version-of-completion-flow but isn't conformant with the older
-"flag-only completion" path. Worth adding before claiming full V5
-conformance.
+**Originally flagged as a gap; corrected on second read.** The
+`COMPLETED` bit (mask `0x0001` in the 16-bit flags field, or
+`0x0000_0001_0000_0000` in the 8-byte header) is documented in
+`service-invocation-protocol.md` as part of the V1–V4 inline-
+completion model. V5's design split commands and notifications into
+separate messages, so no V5 SDK uses the flag at decode time —
+verified by inspection of Java's `MessageHeader.parse` and a grep
+across the entire statemachine module. Storing the flags field
+unused matches Java exactly. Worth keeping in mind for any future
+multi-protocol-version SDK; not a v0.1 gap.
 
 ### State machine FSM
 
@@ -348,40 +347,36 @@ These are intentional design choices, not gaps.
 
 ## Things to fix based on the read
 
-In rough priority order. None are blocking the conformance results
-we already have, but each is a plausible source of "the runtime
-treated my error in an unexpected way" surprises.
+Four fix-able gaps surfaced. None are blocking the conformance
+results we already have, but each is a plausible source of "the
+runtime treated my error in an unexpected way" surprises. **All four
+have now been landed** (commit history starting with the one that
+adds this section).
 
-1. **Journal-mismatch → ErrorMessage{code: 570}.** Currently
-   `pop_recorded!/2` in [`Invocation.ex:293-301`](../apps/restate_server/lib/restate/server/invocation.ex#L293)
-   raises `RuntimeError`, which becomes `ErrorMessage{code: 500}` —
-   making Restate retry on what should be a non-retryable journal
-   divergence. Defining a dedicated `Restate.ProtocolError` with code
-   570 and routing it through the existing exception handler is ~20
-   LoC.
+1. **Journal-mismatch → `ErrorMessage{code: 570}`.** Previously
+   `pop_recorded!/2` in `Invocation.ex` raised `RuntimeError`, which
+   became `ErrorMessage{code: 500}` — making Restate retry on what
+   should be a non-retryable journal divergence. Now wraps in
+   `Restate.ProtocolError` and routes to `ErrorMessage{code: 570}`
+   (JOURNAL_MISMATCH per `service-invocation-protocol.md`).
 
-2. **Header flag bits — `COMPLETED` (0x0001) on completable command frames.**
-   Java's `MessageHeader` distinguishes "completed at creation" from
-   "completed via subsequent notification." We currently only
-   recognize the notification path. Adding the flag-completion path
-   requires touching `Framer.decode/1` to expose the flag and
-   `partition_journal/1` to read result fields off completed
-   commands. ~30 LoC.
+2. **`related_command_index` / `_name` / `_type` on ErrorMessage.**
+   Restate's UI uses these for debugging output. The Invocation now
+   tracks `current_command_index` + `current_command_name` +
+   `current_command_type` as it processes each command (replay or
+   fresh emit), and populates the related_command fields when
+   emitting `ErrorMessage`.
 
-3. **`related_command_index` / `_name` / `_type` on ErrorMessage.**
-   Cosmetic but Restate's UI uses these. Track current entry index
-   + name + type in Invocation state, populate when emitting
-   ErrorMessage. ~20 LoC.
+3. **Completion-ID allocator: switched from scan to counter.**
+   Replaced the O(N) `max(seen completion_id) + 1` scan with a
+   counter field initialized from the journal's last seen + 1,
+   incremented on allocation. Matches Java's `Journal.completionIndex`
+   exactly. Same correctness; cleaner code; O(1) per allocation.
 
-4. **Completion-ID allocator: switch to a counter.** Replace the
-   `max+1` scan with a `next_completion_id` field initialized from
-   the journal's last seen + 1, incremented on allocation. Cleaner;
-   matches Java exactly. ~10 LoC; useful when handlers do many
-   completable ops per invocation.
-
-5. **Reserve signal IDs 1–16.** When `SendSignalCommandMessage`
-   support lands (post-v0.1), allocator must start at 17 per
-   `Journal.java:27`. Note in the source.
+4. **Signal IDs reserved 1–16 (post-v0.1 marker).** When
+   `SendSignalCommandMessage` support lands, the signal allocator
+   must start at 17 per `Journal.java:27`. Documented in the source
+   so it's not lost.
 
 ## v0.2 work surfaced by the read
 

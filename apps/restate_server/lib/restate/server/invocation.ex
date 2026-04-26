@@ -76,6 +76,7 @@ defmodule Restate.Server.Invocation do
       end
 
     {recorded_commands, notifications} = partition_journal(replay_journal)
+    initial_completion_id = max_completion_id_seen(replay_journal) + 1
 
     parent = self()
 
@@ -102,8 +103,13 @@ defmodule Restate.Server.Invocation do
        state_map: state_map,
        recorded_commands: recorded_commands,
        notifications: notifications,
-       next_completion_id: starting_completion_id(replay_journal),
+       next_completion_id: initial_completion_id,
        emitted: [],
+       # Tracking for ErrorMessage.related_command_* fields (mirrors
+       # Java's Journal.lastCommandMetadata). Index starts at -1
+       # meaning "no command processed yet"; advances on each
+       # consume_command/2 call (replay or fresh emit).
+       current_command: %{index: -1, name: nil, type: nil},
        awaiting_response: nil,
        result_body: nil,
        handler_pid: handler_pid
@@ -116,7 +122,7 @@ defmodule Restate.Server.Invocation do
   end
 
   @impl true
-  def handle_call({:set_state, key, value_bytes}, _from, state) do
+  def handle_call({:set_state, key, value_bytes}, from, state) do
     cmd = %Pb.SetStateCommandMessage{key: key, value: %Pb.Value{content: value_bytes}}
     state = %{state | state_map: Map.put(state.state_map, key, value_bytes)}
 
@@ -124,42 +130,55 @@ defmodule Restate.Server.Invocation do
       :replaying ->
         # In replay we do NOT re-emit; we only consume the next recorded
         # command and validate it's a SetStateCommandMessage.
-        {_, rest} = pop_recorded!(state.recorded_commands, Pb.SetStateCommandMessage)
-        {:reply, :ok, advance_phase(%{state | recorded_commands: rest})}
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.SetStateCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded)
+          {:reply, :ok, advance_phase(state)}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
 
       :processing ->
-        {:reply, :ok, %{state | emitted: [cmd | state.emitted]}}
+        state = state |> Map.update!(:emitted, &[cmd | &1]) |> track_command(cmd)
+        {:reply, :ok, state}
     end
   end
 
-  def handle_call({:clear_state, key}, _from, state) do
+  def handle_call({:clear_state, key}, from, state) do
     cmd = %Pb.ClearStateCommandMessage{key: key}
     state = %{state | state_map: Map.delete(state.state_map, key)}
 
     case state.phase do
       :replaying ->
-        {_, rest} = pop_recorded!(state.recorded_commands, Pb.ClearStateCommandMessage)
-        {:reply, :ok, advance_phase(%{state | recorded_commands: rest})}
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.ClearStateCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded)
+          {:reply, :ok, advance_phase(state)}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
 
       :processing ->
-        {:reply, :ok, %{state | emitted: [cmd | state.emitted]}}
+        state = state |> Map.update!(:emitted, &[cmd | &1]) |> track_command(cmd)
+        {:reply, :ok, state}
     end
   end
 
   def handle_call({:sleep, duration_ms}, from, state) do
     case state.phase do
       :replaying ->
-        {recorded, rest} = pop_recorded!(state.recorded_commands, Pb.SleepCommandMessage)
-        state = advance_phase(%{state | recorded_commands: rest})
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.SleepCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
 
-        case Map.fetch(state.notifications, recorded.result_completion_id) do
-          {:ok, _} ->
-            # Completion already in the replay journal — sleep returns now.
-            {:reply, :ok, state}
+          case Map.fetch(state.notifications, recorded.result_completion_id) do
+            {:ok, _} ->
+              # Completion already in the replay journal — sleep returns now.
+              {:reply, :ok, state}
 
-          :error ->
-            # Recorded sleep, completion not yet stored. Suspend on this id.
-            suspend(state, recorded.result_completion_id, from)
+            :error ->
+              # Recorded sleep, completion not yet stored. Suspend on this id.
+              suspend(state, recorded.result_completion_id, from)
+          end
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
         end
 
       :processing ->
@@ -170,11 +189,11 @@ defmodule Restate.Server.Invocation do
           result_completion_id: cid
         }
 
-        state = %{
+        state =
           state
-          | emitted: [cmd | state.emitted],
-            next_completion_id: cid + 1
-        }
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
 
         # REQUEST_RESPONSE mode: no completion will arrive on this stream,
         # so we suspend immediately on the freshly-emitted sleep id.
@@ -220,17 +239,27 @@ defmodule Restate.Server.Invocation do
   end
 
   def handle_info({:handler_result, {:error, exception, stacktrace}}, state) do
-    err = %Pb.ErrorMessage{
-      code: 500,
-      message: Exception.message(exception),
-      stacktrace: Exception.format_stacktrace(stacktrace)
-    }
+    code =
+      case exception do
+        %Restate.ProtocolError{code: code} -> code
+        _ -> 500
+      end
 
-    # ErrorMessage on its own is a terminal frame (per V5 spec it replaces
-    # EndMessage). State-mutating commands emitted before the failure are
-    # still part of the journal and remain in `state.emitted`. The runtime
-    # treats this as a retryable failure — the invocation will be retried
-    # with the existing journal.
+    err =
+      %Pb.ErrorMessage{
+        code: code,
+        message: Exception.message(exception),
+        stacktrace: Exception.format_stacktrace(stacktrace)
+      }
+      |> with_related_command(state.current_command)
+
+    # ErrorMessage on its own is a terminal frame (per V5 spec it
+    # replaces EndMessage). State-mutating commands emitted before the
+    # failure are still part of the journal and remain in
+    # `state.emitted`. Codes:
+    #   * 500   — generic handler failure; runtime retries.
+    #   * 570   — JOURNAL_MISMATCH; runtime stops, surfaces to operator.
+    #   * 571   — PROTOCOL_VIOLATION; same.
     finalize(encode_response(state.emitted, [err]), state)
   end
 
@@ -273,15 +302,20 @@ defmodule Restate.Server.Invocation do
     String.ends_with?(name, "CommandMessage")
   end
 
-  # Highest existing completion_id in the replay journal + 1. Notifications
-  # use the same id space as the commands that produced them, so we walk
-  # both. For Week 3 only sleep allocates ids, but write the helper
-  # generically so future commands plug in without changing this call site.
-  defp starting_completion_id(frames) do
+  # Highest completion_id observed in the replay journal — across recorded
+  # commands' `result_completion_id` and notifications' `completion_id`.
+  # Returns 0 for an empty journal so callers can use `+1` to seed a
+  # one-based counter.
+  #
+  # Note for v0.2: signal IDs reserve slots 1–16 per Java's
+  # `Journal.signalIndex = 17` (sdk-java/.../statemachine/Journal.java:27).
+  # When SendSignalCommandMessage support lands, signal-id allocation
+  # must start at 17, not at 1; completion-ids share the slot 1+ range
+  # because they're a different namespace.
+  defp max_completion_id_seen(frames) do
     frames
     |> Enum.flat_map(&extract_completion_ids/1)
     |> Enum.max(fn -> 0 end)
-    |> Kernel.+(1)
   end
 
   defp extract_completion_ids(%Frame{message: %{result_completion_id: id}}) when is_integer(id),
@@ -290,18 +324,80 @@ defmodule Restate.Server.Invocation do
   defp extract_completion_ids(%Frame{message: %{completion_id: id}}) when is_integer(id), do: [id]
   defp extract_completion_ids(_), do: []
 
-  defp pop_recorded!([%expected_mod{} = head | rest], expected_mod), do: {head, rest}
+  # Pop the next recorded command, asserting its protobuf module matches
+  # `expected_mod`. Returns `{:ok, {head, rest}}` on match, `{:error,
+  # %Restate.ProtocolError{}}` on type mismatch or empty journal — caller
+  # routes the error through `finalize_journal_mismatch/3` so the runtime
+  # gets ErrorMessage{code: 570} rather than the GenServer crashing.
+  defp pop_recorded([%expected_mod{} = head | rest], expected_mod), do: {:ok, {head, rest}}
 
-  defp pop_recorded!([%mod{} | _], expected_mod) do
-    raise "journal mismatch: expected #{inspect(expected_mod)}, got #{inspect(mod)}"
+  defp pop_recorded([%mod{} | _], expected_mod) do
+    {:error,
+     %Restate.ProtocolError{
+       message:
+         "journal mismatch: expected #{inspect(expected_mod)}, " <>
+           "next recorded entry is #{inspect(mod)}",
+       code: Restate.ProtocolError.journal_mismatch()
+     }}
   end
 
-  defp pop_recorded!([], expected_mod) do
-    raise "journal mismatch: expected #{inspect(expected_mod)}, journal exhausted"
+  defp pop_recorded([], expected_mod) do
+    {:error,
+     %Restate.ProtocolError{
+       message:
+         "journal mismatch: expected #{inspect(expected_mod)}, journal exhausted",
+       code: Restate.ProtocolError.journal_mismatch()
+     }}
+  end
+
+  # Build an ErrorMessage{code: 570/571} from a Restate.ProtocolError, route
+  # it through finalize. The handler's GenServer.call goes un-replied; when
+  # the Invocation exits :normal, the handler's call detects DOWN and the
+  # handler exits — same close-out shape as suspension.
+  defp finalize_journal_mismatch(state, %Restate.ProtocolError{} = exc, _from) do
+    err =
+      %Pb.ErrorMessage{code: exc.code, message: exc.message}
+      |> with_related_command(state.current_command)
+
+    finalize(encode_response(state.emitted, [err]), state)
   end
 
   defp advance_phase(%{recorded_commands: []} = state), do: %{state | phase: :processing}
   defp advance_phase(state), do: state
+
+  # Bump current_command tracking after a command is consumed (replay) or
+  # emitted (processing). Populates ErrorMessage.related_command_* on
+  # subsequent failures.
+  defp track_command(state, %mod{} = cmd) do
+    name =
+      case Map.get(cmd, :name, "") do
+        "" -> nil
+        name when is_binary(name) -> name
+        _ -> nil
+      end
+
+    %{
+      state
+      | current_command: %{
+          index: state.current_command.index + 1,
+          name: name,
+          type: Restate.Protocol.Messages.type_for_module(mod)
+        }
+    }
+  end
+
+  # Populate ErrorMessage.related_command_* fields from tracked
+  # current_command. Index < 0 means no command has been processed yet
+  # (e.g. handler raised before any context call) — leave fields unset.
+  defp with_related_command(%Pb.ErrorMessage{} = err, %{index: index, name: name, type: type})
+       when index >= 0 do
+    err = %{err | related_command_index: index}
+    err = if name, do: %{err | related_command_name: name}, else: err
+    err = if type, do: %{err | related_command_type: type}, else: err
+    err
+  end
+
+  defp with_related_command(err, _), do: err
 
   # Suspend on `completion_id`. The handler call (`from`) is left
   # un-replied-to: when we exit, the linked handler process dies and the
