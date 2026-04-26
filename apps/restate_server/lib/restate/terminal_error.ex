@@ -25,7 +25,11 @@ defmodule Restate.TerminalError do
       end
   """
 
-  defexception [:message, code: 500]
+  defexception [:message, code: 500, metadata: %{}]
 
-  @type t :: %__MODULE__{message: binary(), code: non_neg_integer()}
+  @type t :: %__MODULE__{
+          message: binary(),
+          code: non_neg_integer(),
+          metadata: %{optional(String.t()) => String.t()}
+        }
 end

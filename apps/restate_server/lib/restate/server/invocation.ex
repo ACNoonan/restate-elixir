@@ -69,7 +69,7 @@ defmodule Restate.Server.Invocation do
   # --- GenServer ---
 
   @impl true
-  def init({%Pb.StartMessage{state_map: state_entries}, input, replay_journal, mfa}) do
+  def init({%Pb.StartMessage{state_map: state_entries, key: object_key}, input, replay_journal, mfa}) do
     state_map =
       for %Pb.StartMessage.StateEntry{key: k, value: v} <- state_entries, into: %{} do
         {k, v}
@@ -81,7 +81,7 @@ defmodule Restate.Server.Invocation do
 
     handler_pid =
       spawn_link(fn ->
-        ctx = %Restate.Context{pid: parent}
+        ctx = %Restate.Context{pid: parent, key: object_key || ""}
         {mod, fun, _arity} = mfa
 
         result =
@@ -205,8 +205,15 @@ defmodule Restate.Server.Invocation do
     # Handler-raised business failure: lands in the journal as an
     # OutputCommandMessage{failure}, terminating the invocation
     # successfully (no runtime retry).
+    metadata =
+      Enum.map(e.metadata || %{}, fn {k, v} ->
+        %Pb.FailureMetadata{key: to_string(k), value: to_string(v)}
+      end)
+
     output = %Pb.OutputCommandMessage{
-      result: {:failure, %Pb.Failure{code: e.code, message: e.message}}
+      result:
+        {:failure,
+         %Pb.Failure{code: e.code, message: e.message || "", metadata: metadata}}
     }
 
     finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), state)

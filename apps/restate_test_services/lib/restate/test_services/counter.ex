@@ -26,11 +26,10 @@ defmodule Restate.TestServices.Counter do
     old = Context.get_state(ctx, @counter_key) || 0
     Context.set_state(ctx, @counter_key, old + value)
 
-    # Java reference throws TerminalException(objectKey()) — once we
-    # expose the per-VirtualObject key on the Context this should pass
-    # the actual key. For now use a fixed marker; UserErrors.kt is what
-    # tests this and will surface the gap.
-    raise Restate.TerminalError, message: "addThenFail terminal failure"
+    # Mirror Java: throw TerminalException(objectKey()).
+    # UserErrors.setStateThenFailShouldPersistState asserts the error
+    # message is the per-VirtualObject key.
+    raise Restate.TerminalError, message: Context.key(ctx)
   end
 
   def get(%Context{} = ctx, _input) do

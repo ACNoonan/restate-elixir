@@ -13,9 +13,19 @@ defmodule Restate.Context do
   """
 
   @enforce_keys [:pid]
-  defstruct [:pid]
+  defstruct [:pid, key: ""]
 
-  @type t :: %__MODULE__{pid: pid()}
+  @type t :: %__MODULE__{pid: pid(), key: String.t()}
+
+  @doc """
+  Per-VirtualObject / Workflow key for this invocation.
+
+  This is the path segment after the service name in `/<Service>/<key>/<handler>`
+  and is mirrored by Restate as `StartMessage.key`. For plain Services
+  (non-keyed) this is the empty string.
+  """
+  @spec key(t()) :: String.t()
+  def key(%__MODULE__{key: key}), do: key
 
   @doc """
   Read a state value by string key.

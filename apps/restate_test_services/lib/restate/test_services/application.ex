@@ -5,6 +5,8 @@ defmodule Restate.TestServices.Application do
 
   @impl true
   def start(_type, _args) do
+    Restate.TestServices.Failing.init_table()
+
     Restate.Server.Registry.register_service(%{
       name: "Counter",
       type: :virtual_object,
@@ -17,6 +19,23 @@ defmodule Restate.TestServices.Application do
         },
         %{name: "get", type: :shared, mfa: {Restate.TestServices.Counter, :get, 2}},
         %{name: "reset", type: :exclusive, mfa: {Restate.TestServices.Counter, :reset, 2}}
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "Failing",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "terminallyFailingCall",
+          type: :exclusive,
+          mfa: {Restate.TestServices.Failing, :terminally_failing_call, 2}
+        },
+        %{
+          name: "failingCallWithEventualSuccess",
+          type: :exclusive,
+          mfa: {Restate.TestServices.Failing, :failing_call_with_eventual_success, 2}
+        }
       ]
     })
 
