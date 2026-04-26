@@ -171,6 +171,11 @@ java -jar restate-sdk-test-suite.jar debug \
   --test-suite=alwaysSuspending --test-name=State 9080
 ```
 
+## Further reading
+
+- [PLAN.md](./PLAN.md) — week-by-week scope, demo roadmap (Demos 2–5 making the BEAM case), known risks
+- [docs/java-sdk-comparison.md](./docs/java-sdk-comparison.md) — component-by-component side-by-side against `restatedev/sdk-java`, the canonical port target. The Java state machine is the only pure-language Restate SDK; reading it line by line is the only way to write a faithful Elixir port. This doc records what that read found, including five concrete fix-able gaps it surfaced.
+
 ## License
 
 MIT — matching Restate's official SDKs (`sdk-java`, `sdk-python`, `sdk-typescript`, `sdk-go` are all MIT-licensed). See [LICENSE](./LICENSE).
