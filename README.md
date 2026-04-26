@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: pre-alpha, active development.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (current; works against `restate-server` 1.6.2). No Hex release yet.
+> **Status: pre-alpha, active development.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (current; verified against `restate-server` 1.6.2). 13 official `sdk-test-suite` conformance tests passing; 0 SDK bugs surfaced so far. No Hex release yet.
 
 ## Why this exists
 
@@ -19,15 +19,17 @@ Teams **already running Restate services** in TypeScript, Java, or Go who want t
 - Restate service protocol **V5** (current; ~37 message types across control / Command / Notification namespaces)
 - **Service** type (stateless handlers)
 - **Virtual Object** type (keyed stateful handlers with serialized concurrency per key)
-- Journaled primitives: `get_state` (eager), `set_state`, `sleep`, `call`, `run`, `awakeable`
-- HTTP/2 endpoint via Bandit
+- Journaled primitives implemented: `get_state` (eager), `set_state`, `clear_state`, `sleep`
+- Journaled primitives planned for v0.1: `call`, `run`, `awakeable`
+- HTTP/2 endpoint via Bandit (REQUEST_RESPONSE protocol mode)
 - Discovery manifest at `GET /discover`
-- Conformance subset from [restatedev/sdk-test-suite](https://github.com/restatedev/sdk-test-suite)
+- Terminal-vs-retryable error distinction (`Restate.TerminalError` → `OutputCommandMessage{failure}`; ordinary raise → `ErrorMessage{500}` → runtime retries)
+- Conformance subset from [restatedev/sdk-test-suite](https://github.com/restatedev/sdk-test-suite) — see [Conformance status](#conformance-status)
 - Local K8s (`kind`) as the durability test bed
 
-**Explicitly deferred** to v0.2+: **Workflow** service type (lifecycle + versioning complexity), V6 protocol, Lambda transport, lazy state, production hardening.
+**Explicitly deferred** to v0.2+: **Workflow** service type (lifecycle + versioning complexity), V6 protocol, Lambda transport, lazy state, full HTTP/2 streaming, production hardening, the four demos that surface BEAM-specific operational properties (see [PLAN.md](./PLAN.md#demos-beyond-the-mvp--making-the-beam-case)).
 
-See [PLAN.md](./PLAN.md) for the week-by-week scope.
+See [PLAN.md](./PLAN.md) for the week-by-week scope and [PLAN.md#known-risks](./PLAN.md#known-risks) for the open technical risks.
 
 ## Quickstart
 
@@ -68,31 +70,106 @@ curl -sS -X POST http://localhost:8080/Greeter/world/count \
 # → "hello 1"
 ```
 
-> Restate persists state across pod restarts: `kubectl delete pod -l
-> app=elixir-handler` and re-curl — the counter keeps incrementing from
-> wherever it left off. Suspending mid-invocation across pod kills lands
-> in Week 3.
-
 In production, prefer the official Helm chart (`helm install restate
 restate/restate`) over the bundled `k8s/restate.yaml`; the local manifest
 is a single-node `emptyDir` setup intended only for the demo.
 
-## Status at a glance
+### The durability demo — pod kill mid-sleep
+
+The handler at `apps/restate_example_greeter/lib/restate/example/greeter.ex` exposes a `long_greet/2` that records a step, sleeps 10s, records another step, and returns. The middle of that 10s window is where Kubernetes' chaos lives:
+
+```sh
+# In one terminal — synchronous invocation; ingress holds the connection
+curl -sS -X POST http://localhost:8080/Greeter/world/long_greet \
+  -H 'content-type: application/json' -d '"world"'
+
+# In another terminal, while the handler is sleeping (~3s in)
+kubectl delete pod -l app=elixir-handler --force --grace-period=0
+```
+
+The pod that started the invocation is force-deleted. Kubernetes spawns a new one — fresh BEAM, no in-memory state, no idea this invocation existed. After the original 10s timer fires, Restate re-invokes the new pod. Our SDK replays the journal, runs the post-sleep code, and returns `"hello world"`. The held curl connection from the ingress side never noticed.
+
+```sh
+restate kv get Greeter world
+#  KEY   VALUE
+#  step  "after_sleep"   ← post-sleep SetState committed
+```
+
+The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixir-handler && docker compose start elixir-handler` mid-sleep.
+
+## Implementation status
 
 | Area | State |
 |---|---|
-| Protocol framing | ✓ encode/decode + 11 unit tests |
-| Discovery manifest | ✓ `GET /discover` (REQUEST_RESPONSE, V5) |
-| Context API (`get_state` / `set_state`) | ✓ eager state |
-| Context API (`sleep` / `call` / `awakeable` / `run`) | — |
-| Example handler (`Greeter` counter Virtual Object) | ✓ persists across pod restarts |
-| `docker-compose` dev loop | ✓ against `restate:1.6.2` |
-| `kind` cluster test bed | ✓ self-contained manifests in `k8s/` |
-| Full `:gen_statem` replay/processing FSM | — (Week 3) |
-| Conformance against `sdk-test-suite` | — |
-| Durability demo (pod kill mid-sleep) | — |
+| Protocol framing (encode/decode, V5 type registry) | ✓ |
+| Discovery manifest at `GET /discover` (REQUEST_RESPONSE, V5) | ✓ |
+| `Restate.Context.get_state` / `set_state` / `clear_state` | ✓ (eager) |
+| `Restate.Context.sleep` + `SuspensionMessage` + journal replay | ✓ |
+| `Restate.Context.key/1` (per-VirtualObject path segment) | ✓ |
+| `Restate.TerminalError` → `OutputCommandMessage{failure}` with metadata | ✓ |
+| Non-terminal raise → `ErrorMessage{500}` → runtime retry | ✓ |
+| Journal-aware Invocation `:replaying` / `:processing` state machine | ✓ |
+| Example handler (`Greeter` counter + `long_greet` durability demo) | ✓ |
+| `docker compose` dev loop against `restate:1.6.2` | ✓ |
+| `kind` cluster test bed with self-contained manifests | ✓ |
+| `Restate.Context.call` (Call command + completion notification) | — v0.1 |
+| `Restate.Context.run` (Run command + result notification) | — v0.1 |
+| `Restate.Context.awakeable` (promise from external completion) | — v0.1 |
+| Lazy state (`GetLazyStateCommandMessage`) | — v0.2 |
+| Full HTTP/2 same-stream suspend/resume | — v0.2 |
+| Workflow service type | — v0.2 |
+| Graceful drain on `SIGTERM` (Demo 3 in [PLAN.md](./PLAN.md#demos-beyond-the-mvp--making-the-beam-case)) | — v0.2 |
 
-Check back in ~4 weeks for the first end-to-end durability demo.
+## Conformance status
+
+Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk-test-suite/releases/tag/v4.1) (the official Restate conformance harness, also used by the Java/TS/Python/Go SDKs in CI).
+
+| Test class (suite: `alwaysSuspending`) | Result | Notes |
+|---|---|---|
+| `State.add` | ✅ | Counter VirtualObject — sequential `add(N)` round-trips, state persists |
+| `State.proxyOneWayAdd` | ❌ | needs `ctx.call` (v0.1 work) |
+| `State.listStateAndClearAll` | ❌ | needs `MapObject` + state-keys |
+| `Sleep.sleep` | ✅ | basic suspend/resume |
+| `Sleep.manySleeps` | ✅ | **50 invocations × 20 sleeps each** = 1,000 total, each one a full suspension cycle |
+| `SleepWithFailures.sleepAndTerminateServiceEndpoint` | ✅ | service container `SIGTERM` mid-sleep |
+| `SleepWithFailures.sleepAndKillServiceEndpoint` | ✅ | service container `SIGKILL` mid-sleep |
+| `KillRuntime.startAndKillRuntimeRetainsTheState` | ✅ | `restate-server` container `SIGKILL` between calls |
+| `StopRuntime.startAndStopRuntimeRetainsTheState` | ✅ | `restate-server` container `SIGTERM` between calls |
+| `UserErrors.invokeTerminallyFailingCall` | ✅ | terminal failure surfaces with message |
+| `UserErrors.invokeTerminallyFailingCallWithMetadata` | ✅ | terminal failure with `Map<String,String>` metadata |
+| `UserErrors.failSeveralTimes(WithMetadata)` (×2) | ✅ | endpoint stays healthy across repeated failures |
+| `UserErrors.setStateThenFailShouldPersistState` | ✅ | state-mutating commands committed before terminal failure |
+| `UserErrors.invocationWithEventualSuccess` | ✅ | retry behavior on non-terminal exceptions |
+| `UserErrors.internalCallFailurePropagation(WithMetadata)` (×2) | ❌ | needs `ctx.call` |
+| `UserErrors.sideEffectWithTerminalError(WithMetadata)` (×2) | ❌ | needs `ctx.run` |
+
+**13 / 19 attempted, 0 SDK bugs found.** Every red maps to a known-scope gap (`ctx.call`, `ctx.run`, lazy state, or a v0.2 service contract), not an SDK defect.
+
+The four cells of the durability matrix are all green:
+
+```
+                    SIGTERM             SIGKILL
+service container   ✅ Sleep…Terminate   ✅ Sleep…Kill
+restate runtime     ✅ StopRuntime       ✅ KillRuntime
+```
+
+Reproduce locally: build the conformance image, then run the harness in `run` mode.
+
+```sh
+docker build -t localhost/restate-elixir-handler:0.1.0 .
+java -jar restate-sdk-test-suite.jar run \
+  --test-suite=alwaysSuspending \
+  --image-pull-policy=CACHED \
+  localhost/restate-elixir-handler:0.1.0
+```
+
+For iterative SDK development without rebuilding the image:
+
+```sh
+cd apps/restate_test_services && mix run --no-halt    # local SDK on :9080
+java -jar restate-sdk-test-suite.jar debug \
+  --test-suite=alwaysSuspending --test-name=State 9080
+```
 
 ## License
 
