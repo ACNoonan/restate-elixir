@@ -22,6 +22,23 @@ defmodule Restate.Example.Greeter.Application do
       ]
     })
 
+    Restate.Server.Registry.register_service(%{
+      name: "NoisyNeighbor",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "light",
+          type: :exclusive,
+          mfa: {Restate.Example.NoisyNeighbor, :light, 2}
+        },
+        %{
+          name: "poisoned",
+          type: :exclusive,
+          mfa: {Restate.Example.NoisyNeighbor, :poisoned, 2}
+        }
+      ]
+    })
+
     Supervisor.start_link([], strategy: :one_for_one, name: Restate.Example.Greeter.Supervisor)
   end
 end
