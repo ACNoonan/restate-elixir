@@ -118,6 +118,88 @@ Plan: reach out after Week 4 with working code and a recorded demo. Frame should
 - Technical thesis: BEAM's `:gen_statem` + OTP supervision + preemptive scheduling as native fit for Restate's state machine
 - **Explicit ask for upstream absorption with a paid-maintainer or contractor arrangement.** The Temporal Erlang SDK precedent (18 months solo work, shipped behind €100/app/mo paywall, concluded commercially unviable as pure OSS) suggests sustained single-maintainer pure-OSS isn't viable for this shape of work. Name it; don't make Stephan guess.
 
+## Demos beyond the MVP — making the BEAM case
+
+Week 3's pod-kill demo is the table-stakes asset: it proves the V5 protocol works under failure in Elixir. Every Restate SDK survives the same scenario; the demo doesn't differentiate Elixir specifically.
+
+The demos below extend that baseline to surface BEAM-specific operational properties — preemptive scheduling, per-process isolation, cheap concurrency, generational GC — by mapping each to a K8s pain point an SRE has already been bitten by. None are MVP scope; all are v0.2+ roadmap. Their job is to give the upstream-absorption pitch reasons beyond polyglot enablement.
+
+Each entry follows: **Real-world pain** (the operational story) → **The demo** (what to build, what to measure) → **Why BEAM specifically** (the technical claim, with comparisons) → **Cost / dependencies**.
+
+### Demo 1 — Pod kill mid-sleep ✓ (Week 3)
+
+The current demo. Invoke `Greeter/world/long_greet`, `kubectl delete pod --force` mid-sleep, runtime re-invokes the new pod, journal replays past the completed sleep, returns `"hello world"`. Proves protocol conformance under failure. No BEAM-specific story — every SDK does this.
+
+### Demo 2 — Noisy-neighbor isolation
+
+**Real-world pain.** "One pathological request took down our handler pod." On Node.js this shape of incident is regex backtracking, JSON-parse on a 100MB blob, an unbounded loop someone shipped on a Friday. The single-threaded event loop blocks; every other in-flight invocation stalls. P99 latency for unrelated traffic spikes for the duration of the bad request. Every SRE running Node in production has worn this pager.
+
+**The demo.** One pod, two handler variants on the same `Greeter` service:
+
+- `Greeter/<key>/light` — state read + sleep 100ms + state write
+- `Greeter/<key>/poisoned` — tight CPU loop for 30s
+
+Workload: 1,000 concurrent `light` invocations + 5 `poisoned` invocations interleaved. Plot P50 / P99 / P999 of the `light` cohort over time. On Elixir, the lines stay flat — the BEAM scheduler preempts each process at its reduction limit (~2,000 reductions, sub-millisecond) regardless of what it's doing. For comparison, ship a TS handler (or Python sync) on a sidecar pod doing the same workload mix; the comparison plot is the asset.
+
+**Why BEAM specifically.** Preemptive scheduling at the runtime level. Node, Python sync, Ruby, and PHP all have cooperative-or-blocking models that this scenario breaks. Java handles it with thread pools but at ~1MB+ per thread (vs ~2KB per BEAM process) and with thread-pool-exhaustion as the new failure mode. Go is competitive — goroutines are cheap and preemption was added in 1.14 — but lacks per-process GC isolation, so a single goroutine allocating heavily can stall others through the shared GC.
+
+**Cost / dependencies.** Medium. Needs the poisoned handler variant, a load generator (`hey` or a small Elixir script), Prometheus + Grafana for the plot. Comparison TS handler is optional but doubles the visual impact. No SDK changes — works on top of v0.1.
+
+### Demo 3 — Graceful node drain
+
+**Real-world pain.** Every K8s upgrade. `kubectl drain` sends SIGTERM with `terminationGracePeriodSeconds` (default 30s). In-flight requests either finish-or-get-killed at grace expiry, or they hold up the drain past the SLO. Most SDKs don't gracefully suspend pending invocations on shutdown — they treat SIGTERM as "wrap up what you can, drop the rest." Restate's runtime can recover dropped work via re-invocation, but you take a latency hit while the stranded journal entries time out.
+
+**The demo.** Three pods behind the same Restate Service. Kick off 100 `long_greet` invocations distributed across the pods. Mid-flight, `kubectl drain <node>` one of them.
+
+The Elixir SDK traps SIGTERM at the `Restate.Server.Application` level, broadcasts a `:drain` signal to its Invocation supervisor, and each in-flight Invocation finishes its current journal step, emits `SuspensionMessage` with whatever completion-ids it's waiting on (or `EndMessage` if the handler finishes during the grace window), and closes cleanly. Restate routes the resumes to the surviving pods. The drain completes inside `terminationGracePeriodSeconds` with zero dropped work and zero retries from the runtime side.
+
+Asset: a side-by-side timeline showing TS pod drain (X% of in-flight requests time out and get re-tried after retry-backoff) vs Elixir pod drain (100% migrate cleanly).
+
+**Why BEAM specifically.** `Process.flag(:trap_exit, true)` + a supervisor that broadcasts a drain signal to its children is a 50-LOC idiom on the BEAM. The supervisor model means "for-each invocation, let it finish its current step, then close" is structurally natural. Doing the equivalent cleanly on Node requires hand-wiring shutdown coordination across every handler module; on Java, `Runtime.addShutdownHook` plus a thread-pool flush dance with timeouts. Goroutine equivalents exist but lack the supervisor abstraction; it's all manual `context.Context` plumbing.
+
+**Cost / dependencies.** High — but high-value. Requires SDK-level work:
+
+- `Process.flag(:trap_exit, true)` in `Restate.Server.Application` plus a SIGTERM handler that calls into a new `Restate.Server.DrainCoordinator`.
+- Per-Invocation drain hook: when in `:processing` and the next handler call would be a new completable command, suspend with the previously-accumulated completion-ids instead.
+- An integration test that stops the supervisor mid-invocation and asserts the response is a clean Suspension, not an Error.
+
+This is the most *visibly* BEAM-flavored demo and worth investing in early in v0.2.
+
+### Demo 4 — High-concurrency fan-out
+
+**Real-world pain.** "Our enrichment workflow hits 50 downstream services per request and we can't run more than ~200 concurrent without the pod OOMing." This is the canonical Node.js memory story — 1,000 in-flight Promises, each retaining a closure scope, balloons heap into the GB range. Java with `CompletableFuture` is similar; Python `asyncio` better but still dwarfs BEAM.
+
+**The demo.** One handler that fans out to 1,000 sub-invocations (`ctx.call`) in parallel via `Task.async_stream`, gathers, and returns. Run 50 of these *concurrently* on a pod with a 256MB memory limit. Plot heap usage and P99 fan-out latency over the run. The numbers are the asset: "256MB pod, 50,000 in-flight Restate invocations, P99 fan-out roundtrip = X ms."
+
+For comparison, the same pattern on TS on the same pod size — expect either OOM or `Promise.all` of 50,000 hitting a memory wall.
+
+**Why BEAM specifically.** ~2KB per process baseline heap, per-process generational GC (no shared heap pressure), preemptive scheduling so one slow sub-call doesn't block the others. Go is the only competitive runtime here on raw concurrency — goroutines are similarly cheap — but Restate's per-invocation model maps more naturally onto BEAM processes than goroutines (each invocation is a process tree with a clean failure boundary, vs a `goroutine` that needs explicit `defer/recover`).
+
+**Cost / dependencies.** Low-to-medium implementation cost — the handler is a few dozen lines. **Hard dependency on `ctx.call` support**, which is post-v0.1 (out-of-scope per the MVP scope). Don't ship Demo 4 until the SDK has `CallCommandMessage` + `CallCompletionNotificationMessage` wired up. v0.2 candidate.
+
+### Demo 5 — Sustained-load soak
+
+**Real-world pain.** "Latency was fine for the first hour, then degraded." Java/HotSpot G1 GC pauses widen under sustained allocation churn. V8 in Node has heap-fragmentation behavior under steady load. Ops teams budget for restarts every N hours as a workaround — which means the workflow runtime is restart-tolerant by necessity, not by design.
+
+**The demo.** 24-hour load test, constant 500 RPS of mixed `long_greet` + `count` invocations on a single 3-pod cluster. Plot P50 / P99 / P999 latency in 1-minute buckets across the full 24 hours. Plot per-pod heap and GC pause distributions.
+
+The thesis the graph defends: BEAM's per-process GC means there is no stop-the-world. Every flat line is a piece of evidence. Compared with a Java SDK on the same workload (canonical G1 sawtooth pause distribution) the comparison is striking.
+
+**Why BEAM specifically.** Each BEAM process has its own heap; GC is per-process and generational. There is no global heap to compact. A pod hosting 50,000 small invocation processes is doing 50,000 independent micro-GCs spread across schedulers, never coordinated, never pausing the world. Java/Go/.NET all share a global heap and pay the coordination cost.
+
+**Cost / dependencies.** Low to write, expensive to run (needs sustained load infrastructure for 24h, Prometheus retention, Grafana dashboards). The point of this demo is that nothing dramatic happens — its asset is the **absence** of sawtooth on the latency graph. Best shipped after Demo 2 has established the methodology.
+
+### Suggested asset bundle for the Ewen conversation
+
+The Week 4 outreach should lead with:
+
+1. **Demo 1** (pod-kill, recorded) — credibility check on protocol conformance.
+2. **Demo 2** (noisy-neighbor, recorded + plot) — the first BEAM-differentiated asset.
+
+Demos 3–5 become the README's "why Elixir specifically" section and the v0.2 commitments. They're load-bearing for the upstream-absorption pitch — Stephan needs reasons to maintain another SDK beyond polyglot enablement, and "BEAM is operationally well-suited to Restate's workload shape, here are four scenarios with numbers" is a defensible one.
+
+Sequencing for v0.2: ship Demo 2 (cheapest BEAM-differentiated asset) → Demo 3 (most visibly BEAM-flavored, requires SDK drain plumbing that's worth shipping anyway) → Demo 4 (waits on `ctx.call`) → Demo 5 (waits on sustained-load infrastructure).
+
 ## Known risks
 
 1. **Bandit HTTP/2 full-duplex streaming** is the single biggest unknown. Plug's model is request-then-response; Restate assumes interleaved frames on one stream. Fallback: **request/response mode** — works for the Week 3 demo (sleep suspension + re-invocation); loses the same-stream suspend/resume optimization. **Don't spend >3 days fighting Bandit before considering the fallback.** Week 1 manifest already advertises `REQUEST_RESPONSE`, so the fallback is the default unless a deliberate upgrade happens later.
