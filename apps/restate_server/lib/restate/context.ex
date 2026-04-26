@@ -38,4 +38,20 @@ defmodule Restate.Context do
   def set_state(%__MODULE__{pid: pid}, key, value) when is_binary(key) do
     GenServer.call(pid, {:set_state, key, Jason.encode!(value)})
   end
+
+  @doc """
+  Sleep for `duration_ms` milliseconds, durably.
+
+  On the first invocation this records a `SleepCommandMessage` and
+  suspends the invocation — the runtime persists the journal, waits for
+  the timer, and re-invokes the handler. On the resumed invocation the
+  recorded sleep entry is replayed and this call returns immediately.
+
+  This call does not return on the first invocation: when the runtime
+  schedules the suspension, the handler process is terminated.
+  """
+  @spec sleep(t(), non_neg_integer()) :: :ok
+  def sleep(%__MODULE__{pid: pid}, duration_ms) when is_integer(duration_ms) and duration_ms >= 0 do
+    GenServer.call(pid, {:sleep, duration_ms}, :infinity)
+  end
 end

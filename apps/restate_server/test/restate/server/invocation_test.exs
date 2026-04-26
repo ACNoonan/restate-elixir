@@ -20,8 +20,23 @@ defmodule Restate.Server.InvocationTest do
     def echo_input(_ctx, input), do: input
   end
 
-  defp run(start, input, mfa) do
-    {:ok, pid} = Invocation.start_link({start, input, mfa})
+  defmodule LongGreet do
+    @moduledoc false
+    alias Restate.Context
+
+    def handle(ctx, name) do
+      Context.set_state(ctx, "step", "started")
+      Context.sleep(ctx, 10_000)
+      Context.set_state(ctx, "step", "after_sleep")
+      "hello #{name}"
+    end
+  end
+
+  defp run(start, input, mfa, replay \\ []) do
+    replay_frames =
+      Enum.map(replay, fn msg -> %Restate.Protocol.Frame{type: 0, flags: 0, message: msg} end)
+
+    {:ok, pid} = Invocation.start_link({start, input, replay_frames, mfa})
     body = Invocation.await_response(pid)
     {:ok, frames, ""} = Framer.decode_all(body)
     Enum.map(frames, & &1.message)
@@ -87,6 +102,80 @@ defmodule Restate.Server.InvocationTest do
                %Pb.SetStateCommandMessage{key: "step"},
                %Pb.ErrorMessage{}
              ] = run(%Pb.StartMessage{}, nil, {HalfWay, :handle, 2})
+    end
+  end
+
+  describe "sleep + suspension (Week 3)" do
+    test "first call: emits SetState, SleepCommand, then SuspensionMessage; no End" do
+      assert [
+               %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: started}},
+               %Pb.SleepCommandMessage{result_completion_id: cid, wake_up_time: wake},
+               %Pb.SuspensionMessage{waiting_completions: [cid_susp]}
+             ] = run(%Pb.StartMessage{}, "world", {LongGreet, :handle, 2})
+
+      assert Jason.decode!(started) == "started"
+      assert cid == cid_susp
+      assert is_integer(wake) and wake > 0
+    end
+
+    test "re-invocation with uncompleted sleep in journal: re-emits Suspension only" do
+      replay = [
+        %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: ~s("started")}},
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0}
+      ]
+
+      start = %Pb.StartMessage{
+        state_map: [%Pb.StartMessage.StateEntry{key: "step", value: ~s("started")}]
+      }
+
+      assert [%Pb.SuspensionMessage{waiting_completions: [1]}] =
+               run(start, "world", {LongGreet, :handle, 2}, replay)
+    end
+
+    test "re-invocation with completed sleep: replays through, emits NEW post-sleep work + End" do
+      replay = [
+        %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: ~s("started")}},
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}}
+      ]
+
+      start = %Pb.StartMessage{
+        state_map: [%Pb.StartMessage.StateEntry{key: "step", value: ~s("started")}]
+      }
+
+      assert [
+               %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: after_sleep}},
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(start, "world", {LongGreet, :handle, 2}, replay)
+
+      assert Jason.decode!(after_sleep) == "after_sleep"
+      assert Jason.decode!(out) == "hello world"
+    end
+
+    test "replayed SetState before the sleep is NOT re-emitted" do
+      # The recorded SetState("started") must be consumed silently by the
+      # state machine — only the post-sleep new work goes on the wire.
+      replay = [
+        %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: ~s("started")}},
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}}
+      ]
+
+      messages =
+        run(
+          %Pb.StartMessage{
+            state_map: [%Pb.StartMessage.StateEntry{key: "step", value: ~s("started")}]
+          },
+          "world",
+          {LongGreet, :handle, 2},
+          replay
+        )
+
+      set_states = Enum.filter(messages, &match?(%Pb.SetStateCommandMessage{}, &1))
+
+      assert [%Pb.SetStateCommandMessage{value: %Pb.Value{content: only}}] = set_states
+      assert Jason.decode!(only) == "after_sleep"
     end
   end
 end

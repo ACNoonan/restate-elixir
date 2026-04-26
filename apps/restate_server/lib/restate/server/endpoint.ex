@@ -44,8 +44,8 @@ defmodule Restate.Server.Endpoint do
         {:ok, body, conn} = Plug.Conn.read_body(conn, length: 1_048_576)
 
         with {:ok, frames, _leftover} <- Framer.decode_all(body),
-             {:ok, start_msg, input} <- extract_invocation(frames) do
-          {:ok, pid} = Invocation.start_link({start_msg, input, mfa})
+             {:ok, start_msg, input, replay_journal} <- extract_invocation(frames) do
+          {:ok, pid} = Invocation.start_link({start_msg, input, replay_journal, mfa})
           response_body = Invocation.await_response(pid)
 
           conn
@@ -62,16 +62,16 @@ defmodule Restate.Server.Endpoint do
     send_resp(conn, 404, "")
   end
 
-  # The runtime always sends StartMessage first and InputCommandMessage second.
-  # Anything past those is replay journal — Week 2 ignores it (the counter
-  # demo doesn't suspend, so re-invocations only carry Start + Input).
+  # The runtime always sends StartMessage first and InputCommandMessage
+  # second. Everything after Input is the recorded journal the runtime is
+  # replaying — recorded *CommandMessages and any *CompletionNotifications
+  # that have already arrived for previously-emitted completable commands.
   defp extract_invocation([
          %Restate.Protocol.Frame{message: %Pb.StartMessage{} = start},
          %Restate.Protocol.Frame{message: %Pb.InputCommandMessage{value: value}}
-         | _rest
+         | rest
        ]) do
-    input = decode_input(value)
-    {:ok, start, input}
+    {:ok, start, decode_input(value), rest}
   end
 
   defp extract_invocation(_), do: {:error, :missing_start_or_input}

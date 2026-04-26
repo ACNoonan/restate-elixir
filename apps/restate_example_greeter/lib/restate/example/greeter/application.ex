@@ -13,6 +13,11 @@ defmodule Restate.Example.Greeter.Application do
           name: "count",
           type: :exclusive,
           mfa: {Restate.Example.Greeter, :count, 2}
+        },
+        %{
+          name: "long_greet",
+          type: :exclusive,
+          mfa: {Restate.Example.Greeter, :long_greet, 2}
         }
       ]
     })
