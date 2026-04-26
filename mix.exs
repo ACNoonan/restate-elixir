@@ -18,9 +18,16 @@ defmodule RestateElixir.MixProject do
   defp releases do
     [
       restate_elixir: [
-        # Boot the example greeter; it depends on restate_server which
-        # depends on restate_protocol, so all three load.
-        applications: [restate_example_greeter: :permanent],
+        # Boot both the example greeter (for the durability demo) and
+        # the test services (for the sdk-test-suite conformance run).
+        # Both depend on restate_server → restate_protocol, so all four
+        # umbrella apps load. The two app modules register independent
+        # services on the shared registry; the conformance harness only
+        # calls the ones each test class needs (Counter, TestUtilsService).
+        applications: [
+          restate_example_greeter: :permanent,
+          restate_test_services: :permanent
+        ],
         include_executables_for: [:unix]
       ]
     ]

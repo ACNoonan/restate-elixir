@@ -20,6 +20,24 @@ defmodule Restate.TestServices.Application do
       ]
     })
 
+    Restate.Server.Registry.register_service(%{
+      name: "TestUtilsService",
+      type: :service,
+      handlers: [
+        %{name: "echo", type: nil, mfa: {Restate.TestServices.TestUtilsService, :echo, 2}},
+        %{
+          name: "uppercaseEcho",
+          type: nil,
+          mfa: {Restate.TestServices.TestUtilsService, :uppercase_echo, 2}
+        },
+        %{
+          name: "sleepConcurrently",
+          type: nil,
+          mfa: {Restate.TestServices.TestUtilsService, :sleep_concurrently, 2}
+        }
+      ]
+    })
+
     Supervisor.start_link([], strategy: :one_for_one, name: Restate.TestServices.Supervisor)
   end
 end
