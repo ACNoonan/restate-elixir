@@ -40,6 +40,14 @@ defmodule Restate.Context do
   end
 
   @doc """
+  Clear a state value. No-op for unknown keys (matches Restate semantics).
+  """
+  @spec clear_state(t(), binary()) :: :ok
+  def clear_state(%__MODULE__{pid: pid}, key) when is_binary(key) do
+    GenServer.call(pid, {:clear_state, key})
+  end
+
+  @doc """
   Sleep for `duration_ms` milliseconds, durably.
 
   On the first invocation this records a `SleepCommandMessage` and

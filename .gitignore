@@ -41,3 +41,6 @@ priv/native/
 
 # asdf / mise local state (keep .tool-versions; ignore per-user overrides)
 .tool-versions.local
+
+# Conformance test reports — generated per run by sdk-test-suite
+/test_report/

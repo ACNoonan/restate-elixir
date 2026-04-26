@@ -105,6 +105,53 @@ defmodule Restate.Server.InvocationTest do
     end
   end
 
+  describe "clear_state" do
+    defmodule Clearer do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.clear_state(ctx, "step")
+        :ok
+      end
+    end
+
+    test "emits ClearStateCommandMessage in :processing" do
+      assert [
+               %Pb.ClearStateCommandMessage{key: "step"},
+               %Pb.OutputCommandMessage{},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Clearer, :handle, 2})
+    end
+
+    test "consumed silently in :replaying — not re-emitted" do
+      replay = [%Pb.ClearStateCommandMessage{key: "step"}]
+
+      assert [%Pb.OutputCommandMessage{}, %Pb.EndMessage{}] =
+               run(%Pb.StartMessage{}, nil, {Clearer, :handle, 2}, replay)
+    end
+  end
+
+  describe "Restate.TerminalError" do
+    defmodule TerminalRaiser do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.set_state(ctx, "step", "started")
+        raise Restate.TerminalError, message: "alice", code: 409
+      end
+    end
+
+    test "raises produce OutputCommandMessage{failure} + End — not ErrorMessage" do
+      assert [
+               %Pb.SetStateCommandMessage{},
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "alice"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {TerminalRaiser, :handle, 2})
+    end
+  end
+
   describe "sleep + suspension (Week 3)" do
     test "first call: emits SetState, SleepCommand, then SuspensionMessage; no End" do
       assert [

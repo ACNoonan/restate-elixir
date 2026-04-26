@@ -132,6 +132,20 @@ defmodule Restate.Server.Invocation do
     end
   end
 
+  def handle_call({:clear_state, key}, _from, state) do
+    cmd = %Pb.ClearStateCommandMessage{key: key}
+    state = %{state | state_map: Map.delete(state.state_map, key)}
+
+    case state.phase do
+      :replaying ->
+        {_, rest} = pop_recorded!(state.recorded_commands, Pb.ClearStateCommandMessage)
+        {:reply, :ok, advance_phase(%{state | recorded_commands: rest})}
+
+      :processing ->
+        {:reply, :ok, %{state | emitted: [cmd | state.emitted]}}
+    end
+  end
+
   def handle_call({:sleep, duration_ms}, from, state) do
     case state.phase do
       :replaying ->
@@ -187,6 +201,17 @@ defmodule Restate.Server.Invocation do
     finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), state)
   end
 
+  def handle_info({:handler_result, {:error, %Restate.TerminalError{} = e, _stack}}, state) do
+    # Handler-raised business failure: lands in the journal as an
+    # OutputCommandMessage{failure}, terminating the invocation
+    # successfully (no runtime retry).
+    output = %Pb.OutputCommandMessage{
+      result: {:failure, %Pb.Failure{code: e.code, message: e.message}}
+    }
+
+    finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), state)
+  end
+
   def handle_info({:handler_result, {:error, exception, stacktrace}}, state) do
     err = %Pb.ErrorMessage{
       code: 500,
@@ -196,7 +221,9 @@ defmodule Restate.Server.Invocation do
 
     # ErrorMessage on its own is a terminal frame (per V5 spec it replaces
     # EndMessage). State-mutating commands emitted before the failure are
-    # still part of the journal and remain in `state.emitted`.
+    # still part of the journal and remain in `state.emitted`. The runtime
+    # treats this as a retryable failure — the invocation will be retried
+    # with the existing journal.
     finalize(encode_response(state.emitted, [err]), state)
   end
 
