@@ -34,6 +34,7 @@ defmodule Restate.Example.NoisyNeighbor do
   alias Restate.Context
 
   @poison_duration_ms 5_000
+  @slow_duration_ms 3_000
 
   def light(%Context{} = ctx, _input) do
     n = (Context.get_state(ctx, "n") || 0) + 1
@@ -43,6 +44,22 @@ defmodule Restate.Example.NoisyNeighbor do
 
   def poisoned(%Context{} = _ctx, _input) do
     burn_until(:os.system_time(:millisecond) + @poison_duration_ms, 0)
+  end
+
+  @doc """
+  In-flight work that drain (Demo 3) needs to protect: state write,
+  3-second pause where the BEAM process is alive but parked in
+  `:timer.sleep`, then a final state write.
+
+  Distinct from `Restate.Context.sleep/2` — this is BEAM-local sleep,
+  meaning the handler stays in our pod's process table for the full
+  duration. SIGTERM-triggered drain must wait for it to finish.
+  """
+  def slow_op(%Context{} = ctx, _input) do
+    Context.set_state(ctx, "step", "started")
+    :timer.sleep(@slow_duration_ms)
+    Context.set_state(ctx, "step", "done")
+    %{ok: true, slept_ms: @slow_duration_ms}
   end
 
   defp burn_until(deadline, acc) do

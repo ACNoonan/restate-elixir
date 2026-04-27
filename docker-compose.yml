@@ -11,6 +11,11 @@ services:
 
   elixir-handler:
     build: .
+    # Demo 3: SIGTERM-driven graceful drain. Need enough headroom for
+    # in-flight invocations to finish before docker-compose escalates
+    # to SIGKILL. The Application's drain grace is 25s; give compose
+    # 30s of leeway.
+    stop_grace_period: 30s
     networks:
       - restate-net
 

@@ -36,6 +36,22 @@ defmodule Restate.Server.Endpoint do
   end
 
   post "/invoke/:service/:handler" do
+    cond do
+      Restate.Server.DrainCoordinator.draining?() ->
+        # Demo 3: graceful drain. Endpoint is rejecting new work so the
+        # in-flight invocations can finish. Restate's ingress will retry
+        # the call against another instance. 503 is the agreed wire
+        # signal for "service temporarily unavailable, retry elsewhere."
+        conn
+        |> put_resp_header("retry-after", "1")
+        |> send_resp(503, "draining")
+
+      true ->
+        dispatch_invocation(conn, service, handler)
+    end
+  end
+
+  defp dispatch_invocation(conn, service, handler) do
     case Registry.lookup_handler(service, handler) do
       :not_found ->
         send_resp(conn, 404, "")

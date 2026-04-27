@@ -78,6 +78,11 @@ defmodule Restate.Server.Invocation do
     {recorded_commands, notifications} = partition_journal(replay_journal)
     initial_completion_id = max_completion_id_seen(replay_journal) + 1
 
+    # Register with the DrainCoordinator so SIGTERM-triggered drain can
+    # wait for us to finish before stopping the BEAM. No-op when the
+    # coordinator isn't running (e.g. in test envs that don't boot it).
+    Restate.Server.DrainCoordinator.register(self())
+
     parent = self()
 
     handler_pid =

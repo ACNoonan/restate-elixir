@@ -35,6 +35,11 @@ defmodule Restate.Example.Greeter.Application do
           name: "poisoned",
           type: :exclusive,
           mfa: {Restate.Example.NoisyNeighbor, :poisoned, 2}
+        },
+        %{
+          name: "slow_op",
+          type: :exclusive,
+          mfa: {Restate.Example.NoisyNeighbor, :slow_op, 2}
         }
       ]
     })
