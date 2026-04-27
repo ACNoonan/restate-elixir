@@ -172,4 +172,57 @@ defmodule Restate.Context do
 
   defp encode_parameter(bytes) when is_binary(bytes), do: bytes
   defp encode_parameter(term), do: Jason.encode!(term)
+
+  @doc """
+  Run a side-effecting function durably. The result is journaled so
+  future replays of this invocation use the recorded value rather
+  than re-executing the function.
+
+  Use this for any non-deterministic operation: random IDs, current
+  time, calls to external APIs, file reads. The function runs at
+  most once per logical "run" — even across crashes / pod restarts.
+
+  ## Failure semantics
+
+    * Function returns normally → result is journaled; future
+      replays return the same value without re-running the function.
+    * Function raises `Restate.TerminalError` → terminal failure is
+      journaled; future replays re-raise the same error. The
+      surrounding handler invocation completes with an
+      `OutputCommandMessage{failure}` unless the user catches it.
+    * Function raises any other exception → not journaled. The SDK
+      emits `ErrorMessage{500}` (retryable); Restate retries the
+      whole invocation, which may run the function again.
+
+  ## Notes
+
+    * The function runs in the handler process (not the Invocation
+      GenServer); it can call back into the Context for state ops
+      that come *before* the run completes, but a re-entrant
+      `Restate.Context.run/2` from inside the function is not
+      supported.
+    * The result must be JSON-encodable. Raw binaries pass through
+      unchanged (use them for opaque blob results).
+  """
+  @spec run(t(), (-> term())) :: term()
+  def run(%__MODULE__{pid: pid}, fun) when is_function(fun, 0) do
+    case GenServer.call(pid, :start_run, :infinity) do
+      {:replay_value, value} ->
+        value
+
+      {:replay_failure, %Restate.TerminalError{} = exc} ->
+        raise exc
+
+      {:execute, cid} ->
+        try do
+          result = fun.()
+          :ok = GenServer.call(pid, {:propose_run, cid, {:value, result}}, :infinity)
+          result
+        rescue
+          e in Restate.TerminalError ->
+            :ok = GenServer.call(pid, {:propose_run, cid, {:failure, e}}, :infinity)
+            reraise e, __STACKTRACE__
+        end
+    end
+  end
 end

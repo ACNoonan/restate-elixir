@@ -37,6 +37,11 @@ defmodule Restate.TestServices.Application do
           mfa: {Restate.TestServices.Failing, :call_terminally_failing_call, 2}
         },
         %{
+          name: "terminallyFailingSideEffect",
+          type: :exclusive,
+          mfa: {Restate.TestServices.Failing, :terminally_failing_side_effect, 2}
+        },
+        %{
           name: "failingCallWithEventualSuccess",
           type: :exclusive,
           mfa: {Restate.TestServices.Failing, :failing_call_with_eventual_success, 2}

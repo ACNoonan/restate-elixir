@@ -265,6 +265,69 @@ defmodule Restate.Server.Invocation do
     end
   end
 
+  def handle_call(:start_run, from, state) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.RunCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+
+          case Map.fetch(state.notifications, recorded.result_completion_id) do
+            {:ok, {:value, %Pb.Value{content: bytes}}} ->
+              {:reply, {:replay_value, decode_response(bytes)}, state}
+
+            {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+              metadata_map = decode_failure_metadata(meta)
+              exc = %Restate.TerminalError{code: code, message: message, metadata: metadata_map}
+              {:reply, {:replay_failure, exc}, state}
+
+            :error ->
+              # Run command in journal but no notification yet — the
+              # propose from a previous invocation didn't commit. Re-execute.
+              {:reply, {:execute, recorded.result_completion_id}, state}
+          end
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+
+        cmd = %Pb.RunCommandMessage{result_completion_id: cid}
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        {:reply, {:execute, cid}, state}
+    end
+  end
+
+  def handle_call({:propose_run, cid, {:value, value}}, _from, state) do
+    propose = %Pb.ProposeRunCompletionMessage{
+      result_completion_id: cid,
+      result: {:value, encode_run_value(value)}
+    }
+
+    {:reply, :ok, %{state | emitted: [propose | state.emitted]}}
+  end
+
+  def handle_call({:propose_run, cid, {:failure, %Restate.TerminalError{} = exc}}, _from, state) do
+    metadata =
+      Enum.map(exc.metadata || %{}, fn {k, v} ->
+        %Pb.FailureMetadata{key: to_string(k), value: to_string(v)}
+      end)
+
+    propose = %Pb.ProposeRunCompletionMessage{
+      result_completion_id: cid,
+      result:
+        {:failure, %Pb.Failure{code: exc.code, message: exc.message || "", metadata: metadata}}
+    }
+
+    {:reply, :ok, %{state | emitted: [propose | state.emitted]}}
+  end
+
   def handle_call({:sleep, duration_ms}, from, state) do
     case state.phase do
       :replaying ->
@@ -493,6 +556,9 @@ defmodule Restate.Server.Invocation do
 
   defp decode_response(""), do: nil
   defp decode_response(bytes) when is_binary(bytes), do: Jason.decode!(bytes)
+
+  defp encode_run_value(bytes) when is_binary(bytes), do: bytes
+  defp encode_run_value(term), do: Jason.encode!(term)
 
   defp decode_failure_metadata(nil), do: %{}
 

@@ -7,23 +7,21 @@ defmodule Restate.TestServices.Failing do
   ### Implemented
 
     * `terminallyFailingCall(input)` — raise `Restate.TerminalError`
-      with the supplied message and optional metadata. Tests the
-      OutputCommandMessage{failure} mapping end-to-end through
-      Restate's ingress.
+      with the supplied message and optional metadata.
     * `callTerminallyFailingCall(input)` — calls a fresh Failing
       instance's `terminallyFailingCall`. The inner terminal failure
-      propagates up via `ctx.call` raising. Tests cross-handler
-      terminal-error propagation.
+      propagates up via `ctx.call` raising.
+    * `terminallyFailingSideEffect(input)` — wraps the terminal
+      raise inside a `ctx.run`. The Run-command's failure
+      notification re-raises on replay, propagating to the outer
+      handler's response.
     * `failingCallWithEventualSuccess()` — fails with a non-terminal
       exception three times in a row, succeeds on the fourth attempt.
-      Tests that ordinary `raise` produces an `ErrorMessage`, which
-      the runtime treats as retryable.
 
   ### Not yet implemented
 
-    * `terminallyFailingSideEffect`   — needs `ctx.run`   (post-v0.1)
-    * `sideEffectSucceedsAfterGivenAttempts` — needs `ctx.run`
-    * `sideEffectFailsAfterGivenAttempts`    — needs `ctx.run`
+    * `sideEffectSucceedsAfterGivenAttempts` — needs Run retry policies
+    * `sideEffectFailsAfterGivenAttempts`    — needs Run retry policies
   """
 
   @counter_table :restate_test_services_failing_counters
@@ -45,6 +43,20 @@ defmodule Restate.TestServices.Failing do
   def terminally_failing_call(_ctx, %{"errorMessage" => message} = input) do
     metadata = Map.get(input, "metadata") || %{}
     raise Restate.TerminalError, message: message, metadata: metadata
+  end
+
+  def terminally_failing_side_effect(
+        %Restate.Context{} = ctx,
+        %{"errorMessage" => message} = input
+      ) do
+    metadata = Map.get(input, "metadata") || %{}
+
+    Restate.Context.run(ctx, fn ->
+      raise Restate.TerminalError, message: message, metadata: metadata
+    end)
+
+    # Unreachable: ctx.run re-raises the TerminalError.
+    raise "should be unreachable"
   end
 
   def call_terminally_failing_call(%Restate.Context{} = ctx, %{"errorMessage" => _} = input) do
