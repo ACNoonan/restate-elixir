@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: pre-alpha, active development.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (current; verified against `restate-server` 1.6.2). 13 official `sdk-test-suite` conformance tests passing; 0 SDK bugs surfaced so far. No Hex release yet.
+> **Status: v0.1 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **19 / 19 official `sdk-test-suite` conformance tests passing across all targeted classes; 0 SDK bugs.** No Hex release yet.
 
 ## Why this exists
 
@@ -19,8 +19,7 @@ Teams **already running Restate services** in TypeScript, Java, or Go who want t
 - Restate service protocol **V5** (current; ~37 message types across control / Command / Notification namespaces)
 - **Service** type (stateless handlers)
 - **Virtual Object** type (keyed stateful handlers with serialized concurrency per key)
-- Journaled primitives implemented: `get_state` (eager), `set_state`, `clear_state`, `sleep`
-- Journaled primitives planned for v0.1: `call`, `run`, `awakeable`
+- Journaled primitives implemented (v0.1 complete): `get_state` (eager), `set_state`, `clear_state`, `clear_all_state`, `state_keys`, `sleep`, `call`, `send`, `run`, `awakeable` + `complete_awakeable`
 - HTTP/2 endpoint via Bandit (REQUEST_RESPONSE protocol mode)
 - Discovery manifest at `GET /discover`
 - Terminal-vs-retryable error distinction (`Restate.TerminalError` → `OutputCommandMessage{failure}`; ordinary raise → `ErrorMessage{500}` → runtime retries)
@@ -106,15 +105,21 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | `Restate.Context.get_state` / `set_state` / `clear_state` | ✓ (eager) |
 | `Restate.Context.sleep` + `SuspensionMessage` + journal replay | ✓ |
 | `Restate.Context.key/1` (per-VirtualObject path segment) | ✓ |
+| `Restate.Context.call` + `Restate.Context.send` (Call / OneWayCall) | ✓ |
+| `Restate.Context.run` (Run command + Propose / completion notification) | ✓ |
+| `Restate.Context.awakeable` + `complete_awakeable` (signal-based) | ✓ |
 | `Restate.TerminalError` → `OutputCommandMessage{failure}` with metadata | ✓ |
+| `Restate.ProtocolError` → `ErrorMessage{code: 570/571}` (non-retryable) | ✓ |
 | Non-terminal raise → `ErrorMessage{500}` → runtime retry | ✓ |
 | Journal-aware Invocation `:replaying` / `:processing` state machine | ✓ |
+| `Restate.Server.DrainCoordinator` + SIGTERM trap (graceful shutdown) | ✓ |
 | Example handler (`Greeter` counter + `long_greet` durability demo) | ✓ |
+| `NoisyNeighbor` + `Drainable` demo handlers (Demos 2 + 3) | ✓ |
 | `docker compose` dev loop against `restate:1.6.2` | ✓ |
 | `kind` cluster test bed with self-contained manifests | ✓ |
-| `Restate.Context.call` (Call command + completion notification) | — v0.1 |
-| `Restate.Context.run` (Run command + result notification) | — v0.1 |
-| `Restate.Context.awakeable` (promise from external completion) | — v0.1 |
+| Run retry policies (max-attempts / backoff) | — v0.2 |
+| Cancellation (`cancelInvocation` + cancel signal) | — v0.2 |
+| Awaitable combinators (`Awaitable.any` / `Awaitable.all`) | — v0.2 |
 | Lazy state (`GetLazyStateCommandMessage`) | — v0.2 |
 | Full HTTP/2 same-stream suspend/resume | — v0.2 |
 | Workflow service type | — v0.2 |
@@ -127,8 +132,8 @@ Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk
 | Test class (suite: `alwaysSuspending`) | Result | Notes |
 |---|---|---|
 | `State.add` | ✅ | Counter VirtualObject — sequential `add(N)` round-trips, state persists |
-| `State.proxyOneWayAdd` | ❌ | needs `ctx.call` (v0.1 work) |
-| `State.listStateAndClearAll` | ❌ | needs `MapObject` + state-keys |
+| `State.proxyOneWayAdd` | ✅ | exercises `ctx.send` via the Proxy service |
+| `State.listStateAndClearAll` | ✅ | exercises `MapObject` + `clear_all_state` + `state_keys` |
 | `Sleep.sleep` | ✅ | basic suspend/resume |
 | `Sleep.manySleeps` | ✅ | **50 invocations × 20 sleeps each** = 1,000 total, each one a full suspension cycle |
 | `SleepWithFailures.sleepAndTerminateServiceEndpoint` | ✅ | service container `SIGTERM` mid-sleep |
@@ -140,10 +145,10 @@ Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk
 | `UserErrors.failSeveralTimes(WithMetadata)` (×2) | ✅ | endpoint stays healthy across repeated failures |
 | `UserErrors.setStateThenFailShouldPersistState` | ✅ | state-mutating commands committed before terminal failure |
 | `UserErrors.invocationWithEventualSuccess` | ✅ | retry behavior on non-terminal exceptions |
-| `UserErrors.internalCallFailurePropagation(WithMetadata)` (×2) | ❌ | needs `ctx.call` |
-| `UserErrors.sideEffectWithTerminalError(WithMetadata)` (×2) | ❌ | needs `ctx.run` |
+| `UserErrors.internalCallFailurePropagation(WithMetadata)` (×2) | ✅ | exercises terminal-error propagation through `ctx.call` |
+| `UserErrors.sideEffectWithTerminalError(WithMetadata)` (×2) | ✅ | exercises terminal failure inside `ctx.run` |
 
-**13 / 19 attempted, 0 SDK bugs found.** Every red maps to a known-scope gap (`ctx.call`, `ctx.run`, lazy state, or a v0.2 service contract), not an SDK defect.
+**19 / 19 across all targeted test classes; 0 SDK bugs found across the entire v0.1 build.**
 
 The four cells of the durability matrix are all green:
 
