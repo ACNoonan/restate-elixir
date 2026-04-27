@@ -49,16 +49,83 @@ defmodule Restate.Example.Fanout do
 
       %{fired: n}
     end
+
+    @doc """
+    Awakeable-based fan-out + gather. Distinct from `run/2` which is
+    fire-and-forget.
+
+    Allocates N awakeables, fires N children (each carrying its
+    awakeable id), awaits them all, returns the aggregated child
+    results.
+
+    HTTP round-trip accounting on the orchestrator side, regardless of N:
+
+      Pass 1: emit N OneWayCalls + Suspension(waiting_signals: [17])
+              (the orchestrator only needs to suspend on the first
+              awakeable; once any one arrives, the next replay will
+              find every signal that arrived in the meantime)
+      Pass 2: replay through every await — they all find their signal
+              already in the notifications table — emit aggregated
+              Output + End.
+
+    So 2 round-trips fixed, the rest is Restate-side parallelism.
+
+    Predicted Node.js equivalent: each `Promise.all`-style await
+    retains a closure scope per outstanding leaf (N closures on the
+    heap). Our Elixir orchestrator holds N tuples of
+    `{task_id, awakeable_id, handle}` (~50 B each), then walks them
+    in a flat enum. Memory delta in N is linear and tiny.
+    """
+    def gather(%Context{} = ctx, %{"size" => n}) when is_integer(n) and n > 0 do
+      awakeables =
+        Enum.map(1..n, fn task_id ->
+          {id, handle} = Context.awakeable(ctx)
+          {task_id, id, handle}
+        end)
+
+      Enum.each(awakeables, fn {task_id, awakeable_id, _handle} ->
+        Context.send_async(ctx, "FanoutLeaf", "complete", %{
+          "task_id" => task_id,
+          "awakeable_id" => awakeable_id
+        })
+      end)
+
+      results =
+        Enum.map(awakeables, fn {_task_id, _id, handle} ->
+          Context.await_awakeable(ctx, handle)
+        end)
+
+      %{
+        gathered: length(results),
+        sample: List.first(results)
+      }
+    end
   end
 
   defmodule Leaf do
+    alias Restate.Context
+
     @doc """
-    Brief leaf work — purely compute-bound, no journaled side effect.
-    The harness measures throughput from container-stats observation:
-    when CPU drops to idle, the leaf queue has drained.
+    Fire-and-forget leaf — pure compute, no journaled side effect.
+    Used by `Orchestrator.run/2`.
     """
     def process(_ctx, %{"task_id" => task_id}) when is_integer(task_id) do
       %{task_id: task_id, ok: true}
+    end
+
+    @doc """
+    Awakeable-completing leaf — used by `Orchestrator.gather/2`.
+    Computes a result and signals it back to the parent via the
+    awakeable id passed in the input.
+    """
+    def complete(%Context{} = ctx, %{"task_id" => task_id, "awakeable_id" => awakeable_id})
+        when is_integer(task_id) and is_binary(awakeable_id) do
+      Context.complete_awakeable(ctx, awakeable_id, %{
+        task_id: task_id,
+        result: "leaf-#{task_id}"
+      })
+
+      nil
     end
   end
 end

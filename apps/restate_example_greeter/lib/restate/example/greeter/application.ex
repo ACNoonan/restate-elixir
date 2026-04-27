@@ -30,6 +30,11 @@ defmodule Restate.Example.Greeter.Application do
           name: "run",
           type: :exclusive,
           mfa: {Restate.Example.Fanout.Orchestrator, :run, 2}
+        },
+        %{
+          name: "gather",
+          type: :exclusive,
+          mfa: {Restate.Example.Fanout.Orchestrator, :gather, 2}
         }
       ]
     })
@@ -42,6 +47,11 @@ defmodule Restate.Example.Greeter.Application do
           name: "process",
           type: nil,
           mfa: {Restate.Example.Fanout.Leaf, :process, 2}
+        },
+        %{
+          name: "complete",
+          type: nil,
+          mfa: {Restate.Example.Fanout.Leaf, :complete, 2}
         }
       ]
     })

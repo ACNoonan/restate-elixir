@@ -1,9 +1,20 @@
 # Demo 4 — High-concurrency fan-out
 
-The throughput-and-memory story. **20,000 in-flight Restate
-invocations on a single elixir-handler pod, +1 MB peak memory over
-baseline.** The BEAM has so much headroom that Restate's ingest
-queue is the bottleneck, not us.
+Two shapes — both useful, both green:
+
+1. **Fire-and-forget** (`Orchestrator.run/2`) — orchestrator fires N
+   children and returns immediately. The throughput-and-memory
+   story. **20,000 in-flight Restate invocations on a single
+   elixir-handler pod, +1 MB peak memory over baseline.**
+2. **Awakeable-based gather** (`Orchestrator.gather/2`) — orchestrator
+   creates N awakeables, fires N children carrying their respective
+   awakeable ids, awaits all, returns aggregated results. **1,000
+   awakeable round-trips in 1.86 s (≈2 ms / leaf).** Two HTTP
+   round-trips on the orchestrator side regardless of N, the rest
+   is Restate-side parallelism.
+
+The BEAM has so much headroom that Restate's ingest queue is the
+bottleneck, not us.
 
 ## The scenario
 
@@ -107,6 +118,68 @@ contract is left for a future commit (write a Node.js
 `FanoutOrchestrator` + `FanoutLeaf`, register them as a sidecar
 service, run the same harness against both pods, plot).
 
+## Variant — awakeable-based fan-out + gather
+
+For workloads that need the children's results (not just "fired N"),
+`Orchestrator.gather/2` does fan-out with result aggregation:
+
+```elixir
+def gather(ctx, %{"size" => n}) do
+  awakeables =
+    Enum.map(1..n, fn i ->
+      {id, handle} = Restate.Context.awakeable(ctx)
+      {i, id, handle}
+    end)
+
+  Enum.each(awakeables, fn {i, id, _} ->
+    Restate.Context.send_async(ctx, "FanoutLeaf", "complete",
+      %{"task_id" => i, "awakeable_id" => id})
+  end)
+
+  Enum.map(awakeables, fn {_, _, handle} ->
+    Restate.Context.await_awakeable(ctx, handle)
+  end)
+end
+```
+
+Round-trip accounting on the orchestrator side, regardless of N:
+
+```
+Pass 1   emit N OneWayCallCommandMessages + Suspension(waiting_signals: [17])
+         (suspends only on the first awakeable)
+Pass 2   replay through every await — all N signals already in the
+         notifications table; emit aggregated Output + End
+         → 2 round-trips total
+```
+
+Measured (against the same `restate:1.6.2` + docker compose stack):
+
+```sh
+$ curl -sS -X POST http://localhost:8080/FanoutOrchestrator/<key>/gather \
+       -H 'idempotency-key: <key>' \
+       -d '{"size": 1000}'
+
+  size=50    → 113 ms   (~2.3 ms/leaf)
+  size=200   → 389 ms   (~1.9 ms/leaf)
+  size=1000  → 1.86 s   (~1.9 ms/leaf)
+```
+
+Linear scaling at ~2 ms/leaf — that's Restate's per-signal-notification
+persistence cost dominating, not our SDK. Each completed child writes
+its `CompleteAwakeableCommandMessage` which Restate must persist
+before delivering the resulting `SignalNotificationMessage` back to
+the orchestrator.
+
+The trade-off vs `Orchestrator.run/2` (fire-and-forget):
+
+| | Throughput shape | Returns | Round-trips on orchestrator |
+|---|---|---|---|
+| `run/2` | best for batch fan-out | `%{fired: N}` | 1 |
+| `gather/2` | best when caller needs results | aggregated `%{gathered: N, ...}` | 2 |
+
+Both shapes use BEAM-cheap per-invocation processes, so the memory
+story is unchanged.
+
 ## Reproduce locally
 
 ```sh
@@ -165,14 +238,10 @@ the orchestrator's wall-clock O(N) rather than O(1).
 
 1. **Awaitable-combinator fan-out** (v0.2). Pair `send_async` with
    awaitable handles so the orchestrator can `Awaitable.all`
-   N children and gather their results without N suspensions.
-   Until that lands, fan-out workloads that need result aggregation
-   should use `Restate.Context.call/5` sequentially or design around
-   awakeables.
+   N children — same throughput, same round-trip cost as the
+   awakeable variant, but with cleaner ergonomics (a single API
+   instead of allocate-id / send / await per child).
 2. **Node.js side-by-side.** Same workload against a TS sidecar.
    Asset is the comparison plot.
 3. **Larger-scale variants.** Push to 100K leaves on a 4-core CI
    node to see where Restate's ingress saturates first.
-4. **Awakeable-based "fan-out and gather"** demo once the
-   completion-id-vs-signal-id awakeable routing is sorted out (see
-   v0.2 work).
