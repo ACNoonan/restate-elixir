@@ -23,6 +23,30 @@ defmodule Restate.Example.Greeter.Application do
     })
 
     Restate.Server.Registry.register_service(%{
+      name: "FanoutOrchestrator",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "run",
+          type: :exclusive,
+          mfa: {Restate.Example.Fanout.Orchestrator, :run, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "FanoutLeaf",
+      type: :service,
+      handlers: [
+        %{
+          name: "process",
+          type: nil,
+          mfa: {Restate.Example.Fanout.Leaf, :process, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "NoisyNeighbor",
       type: :virtual_object,
       handlers: [

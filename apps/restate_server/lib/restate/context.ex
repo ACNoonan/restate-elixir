@@ -147,6 +147,10 @@ defmodule Restate.Context do
   handler runs to completion independently — we don't wait for its
   result.
 
+  Use `send_async/5` instead when you don't need the invocation id —
+  it skips that round-trip entirely, which is the point of fan-out
+  workloads.
+
   ## Arguments
 
   Same shape as `call/5`. Use this when you want to kick off work
@@ -158,6 +162,42 @@ defmodule Restate.Context do
     GenServer.call(
       pid,
       {:send,
+       %{
+         service: service,
+         handler: handler,
+         parameter: encode_parameter(parameter),
+         key: Keyword.get(opts, :key, ""),
+         idempotency_key: Keyword.get(opts, :idempotency_key),
+         invoke_at_ms: Keyword.get(opts, :invoke_at_ms, 0)
+       }},
+      :infinity
+    )
+  end
+
+  @doc """
+  Truly fire-and-forget variant of `send/5`: emits the
+  `OneWayCallCommandMessage` and returns `:ok` immediately. **Does
+  not wait for the runtime to confirm the spawn.** The caller cannot
+  see the spawned invocation's id.
+
+  This is the high-concurrency fan-out primitive — see Demo 4. From
+  one orchestrator handler you can issue thousands of `send_async`
+  calls in a row, each costing essentially zero (one journaled
+  command, no HTTP round-trip). When you eventually suspend (e.g.,
+  on `await_awakeable/2`), all the spawned invocations run in
+  parallel in Restate.
+
+  ## Trade-off vs `send/5`
+
+      send/5         | round-trip per send | returns invocation_id
+      send_async/5   | zero round-trips    | returns :ok
+  """
+  @spec send_async(t(), String.t(), String.t(), term(), keyword()) :: :ok
+  def send_async(%__MODULE__{pid: pid}, service, handler, parameter, opts \\ [])
+      when is_binary(service) and is_binary(handler) do
+    GenServer.call(
+      pid,
+      {:send_async,
        %{
          service: service,
          handler: handler,

@@ -235,6 +235,44 @@ defmodule Restate.Server.Invocation do
     end
   end
 
+  def handle_call({:send_async, target}, from, state) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.OneWayCallCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          {:reply, :ok, state}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid_invok = state.next_completion_id
+
+        cmd = %Pb.OneWayCallCommandMessage{
+          service_name: target.service,
+          handler_name: target.handler,
+          parameter: target.parameter,
+          key: target.key || "",
+          idempotency_key: target.idempotency_key,
+          invoke_time: target.invoke_at_ms || 0,
+          invocation_id_notification_idx: cid_invok
+        }
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid_invok + 1)
+          |> track_command(cmd)
+
+        # Fire-and-forget: do NOT suspend on the invocation_id
+        # notification. The notification will arrive in some future
+        # journal but we won't observe it. This is what makes
+        # high-concurrency fan-out viable — N send_asyncs cost N
+        # journal entries, not N HTTP round-trips.
+        {:reply, :ok, state}
+    end
+  end
+
   def handle_call({:send, target}, from, state) do
     case state.phase do
       :replaying ->
