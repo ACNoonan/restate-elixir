@@ -8,6 +8,35 @@ defmodule Restate.TestServices.Application do
     Restate.TestServices.Failing.init_table()
 
     Restate.Server.Registry.register_service(%{
+      name: "KillTestRunner",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "startCallTree",
+          type: :exclusive,
+          mfa: {Restate.TestServices.KillTest.Runner, :start_call_tree, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "KillTestSingleton",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "recursiveCall",
+          type: :exclusive,
+          mfa: {Restate.TestServices.KillTest.Singleton, :recursive_call, 2}
+        },
+        %{
+          name: "isUnlocked",
+          type: :exclusive,
+          mfa: {Restate.TestServices.KillTest.Singleton, :is_unlocked, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "AwakeableHolder",
       type: :virtual_object,
       handlers: [
