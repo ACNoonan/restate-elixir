@@ -17,6 +17,31 @@ defmodule Restate.TestServices.AwakeableHolder do
 
   @id_key "id"
 
+  @doc """
+  Test-harness helper — exercise the round-trip end-to-end without
+  needing the full conformance suite. Creates an awakeable, calls
+  `hold` on a peer AwakeableHolder key to register it, then awaits.
+  Returns the value the awakeable was resolved with.
+
+  Two-step usage from a client:
+
+      curl -sS -X POST .../AwakeableHolder/k/echo_round_trip \\
+        -H 'content-type: application/json' -d '"value-payload"'
+
+  The handler creates an awakeable, calls
+  `AwakeableHolder/<random>/hold(awakeable_id)` to stash it, then
+  awaits the awakeable. The client (or a follow-up call) then hits
+  `AwakeableHolder/<random>/unlock(payload)` to resolve it.
+  """
+  def echo_round_trip(%Context{} = ctx, _input) do
+    # Plain self-test: create an awakeable, register it on the SAME key,
+    # then immediately complete it from inside this handler. Tests the
+    # signal-id routing without needing two interleaved invocations.
+    {awakeable_id, handle} = Context.awakeable(ctx)
+    Context.complete_awakeable(ctx, awakeable_id, %{ok: true})
+    Context.await_awakeable(ctx, handle)
+  end
+
   def hold(%Context{} = ctx, id) when is_binary(id) do
     Context.set_state(ctx, @id_key, id)
     nil

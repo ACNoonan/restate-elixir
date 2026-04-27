@@ -79,7 +79,13 @@ defmodule Restate.Server.Invocation do
       partition_journal(replay_journal)
 
     initial_completion_id = max_completion_id_seen(replay_journal) + 1
-    initial_signal_id = max(max_signal_id_seen(replay_journal), 16) + 1
+    # Signal ids are allocator-deterministic: every replay must reproduce
+    # the same signal_id sequence as the first execution. Java's
+    # Journal.signalIndex resets to 17 on every invocation; we do the
+    # same. (1–16 are reserved for built-in signals like cancel.)
+    # Don't seed from the journal — the journal's signal notifications
+    # are the *result* of allocations, not their source of truth.
+    initial_signal_id = 17
 
     # Register with the DrainCoordinator so SIGTERM-triggered drain can
     # wait for us to finish before stopping the BEAM. No-op when the
@@ -606,21 +612,6 @@ defmodule Restate.Server.Invocation do
     |> Enum.max(fn -> 0 end)
   end
 
-  # Highest signal_id observed in the replay journal (from
-  # SignalNotificationMessage entries). 0 if none — caller adds 17 to
-  # seed the next allocation, since 1–16 are reserved.
-  defp max_signal_id_seen(frames) do
-    frames
-    |> Enum.flat_map(fn
-      %Frame{message: %Pb.SignalNotificationMessage{signal_id: {:idx, id}}} when is_integer(id) ->
-        [id]
-
-      _ ->
-        []
-    end)
-    |> Enum.max(fn -> 0 end)
-  end
-
   defp extract_completion_ids(%Frame{message: %Pb.SignalNotificationMessage{}}), do: []
 
   defp extract_completion_ids(%Frame{message: %{result_completion_id: id}}) when is_integer(id),
@@ -694,13 +685,30 @@ defmodule Restate.Server.Invocation do
   defp encode_run_value(bytes) when is_binary(bytes), do: bytes
   defp encode_run_value(term), do: Jason.encode!(term)
 
-  # Awakeable id format per service-invocation-protocol.md:
-  #   "prom_1" + base64url(StartMessage.id ++ <<signal_id::32-big>>)
-  # Same shape sdk-java emits; external code can decode and route the
-  # eventual completion back to this invocation.
+  # Awakeable id encoding for V5 / signal-based awakeables.
+  #
+  #   "sign_1" + base64url(StartMessage.id ++ <<signal_id::32-big>>)
+  #
+  # Restate's runtime distinguishes two awakeable id formats:
+  #   * "prom_1..." → AwakeableIdentifier → routes the completion as a
+  #     completion-id-keyed notification (V1–V4 model). Using this on a
+  #     V5 SDK produces "no command in journal for completion index N"
+  #     errors at the runtime.
+  #   * "sign_1..." → ExternalSignalIdentifier → routes via
+  #     OutboxMessage::NotifySignal → SignalNotificationMessage on the
+  #     target invocation's journal. This is what V5 wants.
+  #
+  # See restate-server's
+  # `crates/worker/.../complete_awakeable_command.rs::apply` and
+  # `crates/types/src/id_util.rs::IdResourceType` for the routing
+  # decision and the prefix mapping.
+  #
+  # The bytes layout is the same for both — invocation_id bytes
+  # followed by a 32-bit big-endian index — so the only thing the
+  # runtime keys off is the prefix.
   defp encode_awakeable_id(start_id, signal_id) when is_binary(start_id) do
     encoded = Base.url_encode64(start_id <> <<signal_id::32-big>>, padding: false)
-    "prom_1" <> encoded
+    "sign_1" <> encoded
   end
 
   defp build_complete_awakeable(awakeable_id, {:value, bytes}) when is_binary(bytes) do

@@ -25,6 +25,11 @@ defmodule Restate.TestServices.Application do
           name: "unlock",
           type: :exclusive,
           mfa: {Restate.TestServices.AwakeableHolder, :unlock, 2}
+        },
+        %{
+          name: "echoRoundTrip",
+          type: :exclusive,
+          mfa: {Restate.TestServices.AwakeableHolder, :echo_round_trip, 2}
         }
       ]
     })

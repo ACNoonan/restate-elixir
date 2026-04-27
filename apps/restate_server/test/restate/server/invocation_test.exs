@@ -300,6 +300,94 @@ defmodule Restate.Server.InvocationTest do
     end
   end
 
+  describe "ctx.awakeable" do
+    defmodule SelfAwait do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        {id, handle} = Context.awakeable(ctx)
+        Context.complete_awakeable(ctx, id, %{value: 42})
+        Context.await_awakeable(ctx, handle)
+      end
+    end
+
+    test "awakeable id uses sign_1 prefix (V5 signal-id routing)" do
+      assert [
+               %Pb.CompleteAwakeableCommandMessage{awakeable_id: id},
+               %Pb.SuspensionMessage{waiting_signals: [signal_id]}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>},
+                 nil,
+                 {SelfAwait, :handle, 2}
+               )
+
+      assert String.starts_with?(id, "sign_1")
+      # First awakeable in any invocation must allocate signal_id 17 —
+      # 1–16 are reserved for built-in signals (cancel, etc.) per
+      # Restate's runtime convention.
+      assert signal_id == 17
+    end
+
+    test "replay with signal notification: await returns the value" do
+      # Mirrors what Restate sends on re-invocation after the
+      # CompleteAwakeable was processed: a SignalNotification with
+      # signal_id 17 carrying the resolution value.
+      replay = [
+        %Pb.CompleteAwakeableCommandMessage{
+          awakeable_id: "sign_1<placeholder>",
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"value" => 42})}}
+        },
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 17},
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"value" => 42})}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>},
+                 nil,
+                 {SelfAwait, :handle, 2},
+                 replay
+               )
+
+      assert Jason.decode!(out) == %{"value" => 42}
+    end
+
+    test "signal-id allocator is deterministic across replays" do
+      # On the second invocation the journal contains a
+      # SignalNotificationMessage with signal_id 17. The allocator
+      # MUST still return 17 for the first awakeable on this run —
+      # if it advanced past 17 (e.g. journal-max+1), the await
+      # would deadlock waiting on a signal id that never fires.
+      replay = [
+        %Pb.CompleteAwakeableCommandMessage{
+          awakeable_id: "sign_1<placeholder>",
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"value" => 42})}}
+        },
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 17},
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"value" => 42})}}
+        }
+      ]
+
+      # The replay completes — proving the deterministic allocation
+      # produced 17 again. No further assertion needed; if the
+      # allocator started at 18 we'd suspend forever and timeout.
+      assert [%Pb.OutputCommandMessage{}, %Pb.EndMessage{}] =
+               run(
+                 %Pb.StartMessage{id: <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>},
+                 nil,
+                 {SelfAwait, :handle, 2},
+                 replay
+               )
+    end
+  end
+
   describe "ctx.send" do
     defmodule Sender do
       alias Restate.Context
