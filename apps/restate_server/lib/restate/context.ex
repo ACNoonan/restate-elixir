@@ -174,6 +174,73 @@ defmodule Restate.Context do
   defp encode_parameter(term), do: Jason.encode!(term)
 
   @doc """
+  Create an awakeable. Returns `{awakeable_id, handle}` where:
+
+    * `awakeable_id` — an opaque string of the form `"prom_1<base64>"`
+      that other handlers (or external code) can use to complete this
+      awakeable via `complete_awakeable/3` or `reject_awakeable/4`.
+      Pass it across the wire freely.
+    * `handle` — opaque token for `await_awakeable/2` later in this
+      same handler.
+
+  ## Use
+
+      {id, handle} = Restate.Context.awakeable(ctx)
+      Restate.Context.call(ctx, "AwakeableHolder", "hold", id, key: "k")
+      # ... external code completes it ...
+      value = Restate.Context.await_awakeable(ctx, handle)
+
+  Awakeables are signal-id-based under the hood: the SDK allocates a
+  signal id (starting from 17 — Restate reserves 1–16), encodes
+  `(StartMessage.id, signal_id)` as the awakeable_id, and waits on a
+  matching `SignalNotificationMessage` when `await_awakeable/2` is
+  called.
+  """
+  @spec awakeable(t()) :: {String.t(), {:awakeable_handle, non_neg_integer()}}
+  def awakeable(%__MODULE__{pid: pid}) do
+    {:ok, {id, signal_id}} = GenServer.call(pid, :awakeable, :infinity)
+    {id, {:awakeable_handle, signal_id}}
+  end
+
+  @doc """
+  Await the result of an awakeable created by `awakeable/1`.
+  Suspends the invocation until the awakeable is completed
+  externally; on resume returns the supplied value (or raises
+  `Restate.TerminalError` if rejected).
+  """
+  @spec await_awakeable(t(), {:awakeable_handle, non_neg_integer()}) :: term()
+  def await_awakeable(%__MODULE__{pid: pid}, {:awakeable_handle, signal_id}) do
+    case GenServer.call(pid, {:await_awakeable, signal_id}, :infinity) do
+      {:ok, value} -> value
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
+  end
+
+  @doc """
+  Complete an awakeable with a success value. The target invocation
+  resumes with this value the next time it executes. No-op locally if
+  the awakeable has already been completed.
+  """
+  @spec complete_awakeable(t(), String.t(), term()) :: :ok
+  def complete_awakeable(%__MODULE__{pid: pid}, awakeable_id, value)
+      when is_binary(awakeable_id) do
+    GenServer.call(pid, {:complete_awakeable, awakeable_id, {:value, encode_parameter(value)}})
+  end
+
+  @doc """
+  Complete an awakeable with a terminal failure. The target invocation
+  raises `Restate.TerminalError{code, message}` on resume.
+  """
+  @spec reject_awakeable(t(), String.t(), non_neg_integer(), String.t()) :: :ok
+  def reject_awakeable(%__MODULE__{pid: pid}, awakeable_id, code, message)
+      when is_binary(awakeable_id) and is_integer(code) and is_binary(message) do
+    GenServer.call(
+      pid,
+      {:complete_awakeable, awakeable_id, {:failure, code, message}}
+    )
+  end
+
+  @doc """
   Run a side-effecting function durably. The result is journaled so
   future replays of this invocation use the recorded value rather
   than re-executing the function.

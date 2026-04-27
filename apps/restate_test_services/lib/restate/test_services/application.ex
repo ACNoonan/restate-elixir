@@ -8,6 +8,28 @@ defmodule Restate.TestServices.Application do
     Restate.TestServices.Failing.init_table()
 
     Restate.Server.Registry.register_service(%{
+      name: "AwakeableHolder",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "hold",
+          type: :exclusive,
+          mfa: {Restate.TestServices.AwakeableHolder, :hold, 2}
+        },
+        %{
+          name: "hasAwakeable",
+          type: :exclusive,
+          mfa: {Restate.TestServices.AwakeableHolder, :has_awakeable, 2}
+        },
+        %{
+          name: "unlock",
+          type: :exclusive,
+          mfa: {Restate.TestServices.AwakeableHolder, :unlock, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "Counter",
       type: :virtual_object,
       handlers: [

@@ -69,14 +69,17 @@ defmodule Restate.Server.Invocation do
   # --- GenServer ---
 
   @impl true
-  def init({%Pb.StartMessage{state_map: state_entries, key: object_key}, input, replay_journal, mfa}) do
+  def init({%Pb.StartMessage{id: start_message_id, state_map: state_entries, key: object_key}, input, replay_journal, mfa}) do
     state_map =
       for %Pb.StartMessage.StateEntry{key: k, value: v} <- state_entries, into: %{} do
         {k, v}
       end
 
-    {recorded_commands, notifications} = partition_journal(replay_journal)
+    {recorded_commands, notifications, signal_notifications} =
+      partition_journal(replay_journal)
+
     initial_completion_id = max_completion_id_seen(replay_journal) + 1
+    initial_signal_id = max(max_signal_id_seen(replay_journal), 16) + 1
 
     # Register with the DrainCoordinator so SIGTERM-triggered drain can
     # wait for us to finish before stopping the BEAM. No-op when the
@@ -106,9 +109,12 @@ defmodule Restate.Server.Invocation do
      %{
        phase: phase,
        state_map: state_map,
+       start_id: start_message_id,
        recorded_commands: recorded_commands,
        notifications: notifications,
+       signal_notifications: signal_notifications,
        next_completion_id: initial_completion_id,
+       next_signal_id: initial_signal_id,
        emitted: [],
        # Tracking for ErrorMessage.related_command_* fields (mirrors
        # Java's Journal.lastCommandMetadata). Index starts at -1
@@ -262,6 +268,64 @@ defmodule Restate.Server.Invocation do
         # use the spawned invocation's id (e.g. Proxy.oneWayCall
         # returns it). REQUEST_RESPONSE mode: arrives on next replay.
         suspend(state, cid_invok, from)
+    end
+  end
+
+  def handle_call(:awakeable, _from, state) do
+    # No journal entry — awakeables are pure signal_id allocations on
+    # the SDK side. The id encodes (start_message_id, signal_id) so
+    # external completers can route to us; we just need to remember
+    # which signal_id we allocated for the await.
+    signal_id = state.next_signal_id
+
+    awakeable_id = encode_awakeable_id(state.start_id, signal_id)
+
+    {:reply, {:ok, {awakeable_id, signal_id}},
+     %{state | next_signal_id: signal_id + 1}}
+  end
+
+  def handle_call({:await_awakeable, signal_id}, from, state) do
+    case Map.fetch(state.signal_notifications, signal_id) do
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        {:reply, {:ok, decode_response(bytes)}, state}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        exc = %Restate.TerminalError{
+          code: code,
+          message: message,
+          metadata: decode_failure_metadata(meta)
+        }
+
+        {:reply, {:terminal_error, exc}, state}
+
+      {:ok, _other} ->
+        # Void or other shapes — return nil to mirror "completed without payload".
+        {:reply, {:ok, nil}, state}
+
+      :error ->
+        # Suspend on the signal_id; SuspensionMessage carries it in
+        # `waiting_signals` rather than `waiting_completions`.
+        suspend_signal(state, signal_id, from)
+    end
+  end
+
+  def handle_call({:complete_awakeable, awakeable_id, completion}, from, state)
+      when is_binary(awakeable_id) do
+    cmd = build_complete_awakeable(awakeable_id, completion)
+
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.CompleteAwakeableCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded)
+          {:reply, :ok, advance_phase(state)}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        state = state |> Map.update!(:emitted, &[cmd | &1]) |> track_command(cmd)
+        {:reply, :ok, state}
     end
   end
 
@@ -436,22 +500,37 @@ defmodule Restate.Server.Invocation do
   # OutputCommandMessage shouldn't appear in a replay (an Output ends the
   # invocation), but we tolerate them by keeping them in the command list.
   defp partition_journal(frames) do
-    Enum.reduce(frames, {[], %{}}, fn %Frame{message: msg}, {cmds, notes} ->
+    Enum.reduce(frames, {[], %{}, %{}}, fn %Frame{message: msg}, {cmds, notes, sigs} ->
       cond do
+        signal_notification?(msg) ->
+          {cmds, notes, Map.put(sigs, signal_notification_id(msg), signal_notification_result(msg))}
+
         notification?(msg) ->
-          {cmds, Map.put(notes, msg.completion_id, notification_result(msg))}
+          {cmds, Map.put(notes, msg.completion_id, notification_result(msg)), sigs}
 
         command?(msg) ->
-          {[msg | cmds], notes}
+          {[msg | cmds], notes, sigs}
 
         true ->
           # Suspension/Error/End/CommandAck shouldn't show up in a replay
           # journal; ignore defensively.
-          {cmds, notes}
+          {cmds, notes, sigs}
       end
     end)
-    |> then(fn {cmds, notes} -> {Enum.reverse(cmds), notes} end)
+    |> then(fn {cmds, notes, sigs} -> {Enum.reverse(cmds), notes, sigs} end)
   end
+
+  # SignalNotificationMessage uses oneof id: completion_id | signal_id |
+  # signal_name. For awakeable support we care about signal_id; others
+  # are out of v0.1 scope.
+  defp signal_notification?(%Pb.SignalNotificationMessage{}), do: true
+  defp signal_notification?(_), do: false
+
+  defp signal_notification_id(%Pb.SignalNotificationMessage{signal_id: {:idx, id}}), do: id
+  defp signal_notification_id(_), do: nil
+
+  defp signal_notification_result(%Pb.SignalNotificationMessage{result: result}), do: result
+  defp signal_notification_result(_), do: :void
 
   defp notification?(%Pb.SleepCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.GetLazyStateCompletionNotificationMessage{}), do: true
@@ -488,6 +567,23 @@ defmodule Restate.Server.Invocation do
     |> Enum.flat_map(&extract_completion_ids/1)
     |> Enum.max(fn -> 0 end)
   end
+
+  # Highest signal_id observed in the replay journal (from
+  # SignalNotificationMessage entries). 0 if none — caller adds 17 to
+  # seed the next allocation, since 1–16 are reserved.
+  defp max_signal_id_seen(frames) do
+    frames
+    |> Enum.flat_map(fn
+      %Frame{message: %Pb.SignalNotificationMessage{signal_id: {:idx, id}}} when is_integer(id) ->
+        [id]
+
+      _ ->
+        []
+    end)
+    |> Enum.max(fn -> 0 end)
+  end
+
+  defp extract_completion_ids(%Frame{message: %Pb.SignalNotificationMessage{}}), do: []
 
   defp extract_completion_ids(%Frame{message: %{result_completion_id: id}}) when is_integer(id),
     do: [id]
@@ -559,6 +655,38 @@ defmodule Restate.Server.Invocation do
 
   defp encode_run_value(bytes) when is_binary(bytes), do: bytes
   defp encode_run_value(term), do: Jason.encode!(term)
+
+  # Awakeable id format per service-invocation-protocol.md:
+  #   "prom_1" + base64url(StartMessage.id ++ <<signal_id::32-big>>)
+  # Same shape sdk-java emits; external code can decode and route the
+  # eventual completion back to this invocation.
+  defp encode_awakeable_id(start_id, signal_id) when is_binary(start_id) do
+    encoded = Base.url_encode64(start_id <> <<signal_id::32-big>>, padding: false)
+    "prom_1" <> encoded
+  end
+
+  defp build_complete_awakeable(awakeable_id, {:value, bytes}) when is_binary(bytes) do
+    %Pb.CompleteAwakeableCommandMessage{
+      awakeable_id: awakeable_id,
+      result: {:value, %Pb.Value{content: bytes}}
+    }
+  end
+
+  defp build_complete_awakeable(awakeable_id, {:failure, code, message}) do
+    %Pb.CompleteAwakeableCommandMessage{
+      awakeable_id: awakeable_id,
+      result: {:failure, %Pb.Failure{code: code, message: message}}
+    }
+  end
+
+  # Like suspend/3 but uses waiting_signals instead of waiting_completions.
+  # Awakeables are signal-id-based per the V5 spec; the runtime resumes
+  # the invocation when any of the waiting signals fires.
+  defp suspend_signal(state, signal_id, _from) do
+    suspension = %Pb.SuspensionMessage{waiting_signals: [signal_id]}
+    body = encode_response(state.emitted, [suspension])
+    finalize(body, state)
+  end
 
   defp decode_failure_metadata(nil), do: %{}
 
