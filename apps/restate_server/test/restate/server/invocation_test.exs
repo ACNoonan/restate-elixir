@@ -207,6 +207,147 @@ defmodule Restate.Server.InvocationTest do
     end
   end
 
+  describe "ctx.call" do
+    defmodule Caller do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        result = Context.call(ctx, "Counter", "add", 5, key: "k1")
+        %{got: result}
+      end
+    end
+
+    test "first call: emits CallCommandMessage(2 cids) + Suspension(result cid)" do
+      assert [
+               %Pb.CallCommandMessage{
+                 service_name: "Counter",
+                 handler_name: "add",
+                 key: "k1",
+                 invocation_id_notification_idx: cid_invok,
+                 result_completion_id: cid_result
+               },
+               %Pb.SuspensionMessage{waiting_completions: [cid_susp]}
+             ] = run(%Pb.StartMessage{}, nil, {Caller, :handle, 2})
+
+      assert cid_invok == 1
+      assert cid_result == 2
+      assert cid_susp == cid_result
+    end
+
+    test "replay with value notification: returns the result, continues" do
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Counter",
+          handler_name: "add",
+          key: "k1",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallInvocationIdCompletionNotificationMessage{
+          completion_id: 1,
+          invocation_id: "inv_xyz"
+        },
+        %Pb.CallCompletionNotificationMessage{
+          completion_id: 2,
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"oldValue" => 0, "newValue" => 5})}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Caller, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"got" => %{"oldValue" => 0, "newValue" => 5}}
+    end
+
+    test "replay with failure notification: raises Restate.TerminalError → OutputCommandMessage{failure}" do
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Counter",
+          handler_name: "add",
+          key: "k1",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallCompletionNotificationMessage{
+          completion_id: 2,
+          result: {:failure, %Pb.Failure{code: 409, message: "callee said no"}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "callee said no"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Caller, :handle, 2}, replay)
+    end
+
+    test "replay without result notification: re-suspends on result_completion_id" do
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Counter",
+          handler_name: "add",
+          key: "k1",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        }
+      ]
+
+      assert [%Pb.SuspensionMessage{waiting_completions: [2]}] =
+               run(%Pb.StartMessage{}, nil, {Caller, :handle, 2}, replay)
+    end
+  end
+
+  describe "ctx.send" do
+    defmodule Sender do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        id = Context.send(ctx, "Counter", "add", 1, key: "k1")
+        %{spawned: id}
+      end
+    end
+
+    test "first send: emits OneWayCallCommandMessage + Suspension(invocation_id_idx)" do
+      assert [
+               %Pb.OneWayCallCommandMessage{
+                 service_name: "Counter",
+                 handler_name: "add",
+                 key: "k1",
+                 invocation_id_notification_idx: cid
+               },
+               %Pb.SuspensionMessage{waiting_completions: [cid_susp]}
+             ] = run(%Pb.StartMessage{}, nil, {Sender, :handle, 2})
+
+      assert cid == 1
+      assert cid_susp == cid
+    end
+
+    test "replay with invocation_id notification: returns the id" do
+      replay = [
+        %Pb.OneWayCallCommandMessage{
+          service_name: "Counter",
+          handler_name: "add",
+          key: "k1",
+          invocation_id_notification_idx: 1
+        },
+        %Pb.CallInvocationIdCompletionNotificationMessage{
+          completion_id: 1,
+          invocation_id: "inv_abc"
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Sender, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"spawned" => "inv_abc"}
+    end
+  end
+
   describe "sleep + suspension (Week 3)" do
     test "first call: emits SetState, SleepCommand, then SuspensionMessage; no End" do
       assert [

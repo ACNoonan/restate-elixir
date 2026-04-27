@@ -49,9 +49,11 @@ defmodule Restate.Server.DrainCoordinatorTest do
     end
 
     test "waits for registered invocations to terminate, then returns" do
+      # Register a process that lives 200ms; drain should block until it exits,
+      # then return promptly. Bounds chosen with margin for scheduler jitter.
       pid =
         spawn(fn ->
-          :timer.sleep(100)
+          :timer.sleep(200)
         end)
 
       DrainCoordinator.register(pid)
@@ -61,8 +63,7 @@ defmodule Restate.Server.DrainCoordinatorTest do
         :timer.tc(fn -> DrainCoordinator.drain(2_000) end)
 
       ms = time_us / 1_000
-      # Should wait ~100ms for the registered process to finish, then return.
-      assert ms >= 80, "drain returned too fast (#{ms}ms) — should wait for invocations"
+      assert ms >= 150, "drain returned too fast (#{ms}ms) — should wait for invocations"
       assert ms < 1_000, "drain over-waited (#{ms}ms) — should return promptly after pid exits"
     end
 

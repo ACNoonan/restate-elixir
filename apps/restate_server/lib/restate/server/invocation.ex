@@ -167,6 +167,78 @@ defmodule Restate.Server.Invocation do
     end
   end
 
+  def handle_call({:call, target}, from, state) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.CallCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          handle_call_result(state, recorded.result_completion_id, from)
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid_invok = state.next_completion_id
+        cid_result = cid_invok + 1
+
+        cmd = %Pb.CallCommandMessage{
+          service_name: target.service,
+          handler_name: target.handler,
+          parameter: target.parameter,
+          key: target.key || "",
+          idempotency_key: target.idempotency_key,
+          invocation_id_notification_idx: cid_invok,
+          result_completion_id: cid_result
+        }
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid_result + 1)
+          |> track_command(cmd)
+
+        # REQUEST_RESPONSE: the result notification arrives on a
+        # subsequent invocation, so we suspend on cid_result.
+        suspend(state, cid_result, from)
+    end
+  end
+
+  def handle_call({:send, target}, from, state) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.OneWayCallCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          handle_send_invocation_id(state, recorded.invocation_id_notification_idx, from)
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid_invok = state.next_completion_id
+
+        cmd = %Pb.OneWayCallCommandMessage{
+          service_name: target.service,
+          handler_name: target.handler,
+          parameter: target.parameter,
+          key: target.key || "",
+          idempotency_key: target.idempotency_key,
+          invoke_time: target.invoke_at_ms || 0,
+          invocation_id_notification_idx: cid_invok
+        }
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid_invok + 1)
+          |> track_command(cmd)
+
+        # We block on the invocation_id notification so callers can
+        # use the spawned invocation's id (e.g. Proxy.oneWayCall
+        # returns it). REQUEST_RESPONSE mode: arrives on next replay.
+        suspend(state, cid_invok, from)
+    end
+  end
+
   def handle_call({:sleep, duration_ms}, from, state) do
     case state.phase do
       :replaying ->
@@ -295,10 +367,15 @@ defmodule Restate.Server.Invocation do
   defp notification?(%Pb.SleepCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.GetLazyStateCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.CallCompletionNotificationMessage{}), do: true
+  defp notification?(%Pb.CallInvocationIdCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.RunCompletionNotificationMessage{}), do: true
   defp notification?(_), do: false
 
   defp notification_result(%Pb.SleepCompletionNotificationMessage{void: void}), do: void || :void
+
+  defp notification_result(%Pb.CallInvocationIdCompletionNotificationMessage{invocation_id: id}),
+    do: {:invocation_id, id}
+
   defp notification_result(%{result: result}), do: result
   defp notification_result(_), do: :void
 
@@ -353,6 +430,48 @@ defmodule Restate.Server.Invocation do
          "journal mismatch: expected #{inspect(expected_mod)}, journal exhausted",
        code: Restate.ProtocolError.journal_mismatch()
      }}
+  end
+
+  # ctx.call replay/processing — once we've located the recorded
+  # command (or emitted a fresh one), check whether the target's
+  # result is already in the notifications map. Replies to the
+  # caller with a tagged tuple; `Restate.Context.call` raises on
+  # `:terminal_error` so user code sees an exception, not a tuple.
+  defp handle_call_result(state, result_completion_id, from) do
+    case Map.fetch(state.notifications, result_completion_id) do
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        {:reply, {:ok, decode_response(bytes)}, state}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        metadata_map = decode_failure_metadata(meta)
+        exc = %Restate.TerminalError{code: code, message: message, metadata: metadata_map}
+        {:reply, {:terminal_error, exc}, state}
+
+      :error ->
+        # Result not in journal yet — suspend on the result completion id.
+        suspend(state, result_completion_id, from)
+    end
+  end
+
+  # ctx.send replay/processing — we wait on the invocation_id notification
+  # so callers can use the id of the spawned invocation.
+  defp handle_send_invocation_id(state, invocation_id_completion_id, from) do
+    case Map.fetch(state.notifications, invocation_id_completion_id) do
+      {:ok, {:invocation_id, id}} when is_binary(id) ->
+        {:reply, id, state}
+
+      :error ->
+        suspend(state, invocation_id_completion_id, from)
+    end
+  end
+
+  defp decode_response(""), do: nil
+  defp decode_response(bytes) when is_binary(bytes), do: Jason.decode!(bytes)
+
+  defp decode_failure_metadata(nil), do: %{}
+
+  defp decode_failure_metadata(metadata) when is_list(metadata) do
+    Enum.into(metadata, %{}, fn %Pb.FailureMetadata{key: k, value: v} -> {k, v} end)
   end
 
   # Build an ErrorMessage{code: 570/571} from a Restate.ProtocolError, route

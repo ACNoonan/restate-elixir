@@ -32,10 +32,25 @@ defmodule Restate.TestServices.Application do
           mfa: {Restate.TestServices.Failing, :terminally_failing_call, 2}
         },
         %{
+          name: "callTerminallyFailingCall",
+          type: :exclusive,
+          mfa: {Restate.TestServices.Failing, :call_terminally_failing_call, 2}
+        },
+        %{
           name: "failingCallWithEventualSuccess",
           type: :exclusive,
           mfa: {Restate.TestServices.Failing, :failing_call_with_eventual_success, 2}
         }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "Proxy",
+      type: :service,
+      handlers: [
+        %{name: "call", type: nil, mfa: {Restate.TestServices.Proxy, :call, 2}},
+        %{name: "oneWayCall", type: nil, mfa: {Restate.TestServices.Proxy, :one_way_call, 2}},
+        %{name: "manyCalls", type: nil, mfa: {Restate.TestServices.Proxy, :many_calls, 2}}
       ]
     })
 

@@ -10,6 +10,10 @@ defmodule Restate.TestServices.Failing do
       with the supplied message and optional metadata. Tests the
       OutputCommandMessage{failure} mapping end-to-end through
       Restate's ingress.
+    * `callTerminallyFailingCall(input)` — calls a fresh Failing
+      instance's `terminallyFailingCall`. The inner terminal failure
+      propagates up via `ctx.call` raising. Tests cross-handler
+      terminal-error propagation.
     * `failingCallWithEventualSuccess()` — fails with a non-terminal
       exception three times in a row, succeeds on the fourth attempt.
       Tests that ordinary `raise` produces an `ErrorMessage`, which
@@ -17,7 +21,6 @@ defmodule Restate.TestServices.Failing do
 
   ### Not yet implemented
 
-    * `callTerminallyFailingCall`     — needs `ctx.call`  (post-v0.1)
     * `terminallyFailingSideEffect`   — needs `ctx.run`   (post-v0.1)
     * `sideEffectSucceedsAfterGivenAttempts` — needs `ctx.run`
     * `sideEffectFailsAfterGivenAttempts`    — needs `ctx.run`
@@ -42,6 +45,20 @@ defmodule Restate.TestServices.Failing do
   def terminally_failing_call(_ctx, %{"errorMessage" => message} = input) do
     metadata = Map.get(input, "metadata") || %{}
     raise Restate.TerminalError, message: message, metadata: metadata
+  end
+
+  def call_terminally_failing_call(%Restate.Context{} = ctx, %{"errorMessage" => _} = input) do
+    # Java reference: spawn a fresh Failing key, call its
+    # terminallyFailingCall, propagate the terminal failure up.
+    key = :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+
+    Restate.Context.call(ctx, "Failing", "terminallyFailingCall", input, key: key)
+
+    # Unreachable: the call raises Restate.TerminalError, which the
+    # SDK then maps to OutputCommandMessage{failure} on this
+    # invocation's response. The runtime propagates it back to the
+    # ingress client as the failure of *this* call.
+    raise "should be unreachable"
   end
 
   def failing_call_with_eventual_success(_ctx, _input) do

@@ -72,4 +72,87 @@ defmodule Restate.Context do
   def sleep(%__MODULE__{pid: pid}, duration_ms) when is_integer(duration_ms) and duration_ms >= 0 do
     GenServer.call(pid, {:sleep, duration_ms}, :infinity)
   end
+
+  @doc """
+  Synchronous request/reply call to another Restate handler. Durable —
+  the journal records the call; on replay the recorded result is
+  returned without re-invoking the target.
+
+  ## Arguments
+
+    * `service` — service name as registered in the manifest.
+    * `handler` — handler name on that service.
+    * `parameter` — JSON-encodable term; sent to the target as the
+      handler input. (For raw bytes, encode them yourself and pass
+      a binary; this SDK's default is JSON.)
+    * `opts`:
+      * `key` — required for `:virtual_object` / `:workflow` targets
+        (the per-key path segment); empty string for plain Services.
+      * `idempotency_key` — opaque string the runtime uses to dedupe.
+
+  Returns the JSON-decoded response. If the target handler raised
+  `Restate.TerminalError`, this call raises a fresh
+  `Restate.TerminalError` here too — terminal failures propagate
+  through the call chain so the originating ingress client sees them.
+
+  Like `sleep/2`, this call does not return on the first execution
+  pass — the SDK suspends and the runtime re-invokes the handler
+  with the call's result in the journal. On the resumed execution
+  the call returns the result.
+  """
+  @spec call(t(), String.t(), String.t(), term(), keyword()) :: term()
+  def call(%__MODULE__{pid: pid}, service, handler, parameter, opts \\ [])
+      when is_binary(service) and is_binary(handler) do
+    case GenServer.call(
+           pid,
+           {:call,
+            %{
+              service: service,
+              handler: handler,
+              parameter: encode_parameter(parameter),
+              key: Keyword.get(opts, :key, ""),
+              idempotency_key: Keyword.get(opts, :idempotency_key)
+            }},
+           :infinity
+         ) do
+      {:ok, value} -> value
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
+  end
+
+  @doc """
+  Fire-and-forget call to another Restate handler. Returns the
+  invocation-id string of the spawned invocation.
+
+  In `REQUEST_RESPONSE` protocol mode this still suspends once
+  (waiting for the runtime to commit the spawn and tell us the
+  invocation id). The cost is one HTTP round-trip; the called
+  handler runs to completion independently — we don't wait for its
+  result.
+
+  ## Arguments
+
+  Same shape as `call/5`. Use this when you want to kick off work
+  and continue without blocking on its result.
+  """
+  @spec send(t(), String.t(), String.t(), term(), keyword()) :: String.t()
+  def send(%__MODULE__{pid: pid}, service, handler, parameter, opts \\ [])
+      when is_binary(service) and is_binary(handler) do
+    GenServer.call(
+      pid,
+      {:send,
+       %{
+         service: service,
+         handler: handler,
+         parameter: encode_parameter(parameter),
+         key: Keyword.get(opts, :key, ""),
+         idempotency_key: Keyword.get(opts, :idempotency_key),
+         invoke_at_ms: Keyword.get(opts, :invoke_at_ms, 0)
+       }},
+      :infinity
+    )
+  end
+
+  defp encode_parameter(bytes) when is_binary(bytes), do: bytes
+  defp encode_parameter(term), do: Jason.encode!(term)
 end
