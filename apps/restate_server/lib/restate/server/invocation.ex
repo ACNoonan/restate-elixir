@@ -148,6 +148,32 @@ defmodule Restate.Server.Invocation do
     end
   end
 
+  def handle_call(:clear_all_state, from, state) do
+    cmd = %Pb.ClearAllStateCommandMessage{}
+    state = %{state | state_map: %{}}
+
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.ClearAllStateCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded)
+          {:reply, :ok, advance_phase(state)}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        state = state |> Map.update!(:emitted, &[cmd | &1]) |> track_command(cmd)
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:state_keys, _from, state) do
+    # Read-only: returns all currently-set state keys from the eager
+    # state map. No journal entry — get_state and state_keys are pure
+    # reads against state we already have.
+    {:reply, Map.keys(state.state_map), state}
+  end
+
   def handle_call({:clear_state, key}, from, state) do
     cmd = %Pb.ClearStateCommandMessage{key: key}
     state = %{state | state_map: Map.delete(state.state_map, key)}

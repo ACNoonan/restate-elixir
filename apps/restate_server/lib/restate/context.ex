@@ -57,6 +57,23 @@ defmodule Restate.Context do
     GenServer.call(pid, {:clear_state, key})
   end
 
+  @doc "Clear every state value for this VirtualObject key."
+  @spec clear_all_state(t()) :: :ok
+  def clear_all_state(%__MODULE__{pid: pid}) do
+    GenServer.call(pid, :clear_all_state)
+  end
+
+  @doc """
+  List the keys of every state entry currently set for this
+  VirtualObject. Read-only — does not emit a journal entry. Reads
+  from the eager state map seeded by `StartMessage.state_map` plus
+  any local writes made earlier in this invocation.
+  """
+  @spec state_keys(t()) :: [binary()]
+  def state_keys(%__MODULE__{pid: pid}) do
+    GenServer.call(pid, :state_keys)
+  end
+
   @doc """
   Sleep for `duration_ms` milliseconds, durably.
 

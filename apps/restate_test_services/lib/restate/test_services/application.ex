@@ -45,6 +45,16 @@ defmodule Restate.TestServices.Application do
     })
 
     Restate.Server.Registry.register_service(%{
+      name: "MapObject",
+      type: :virtual_object,
+      handlers: [
+        %{name: "set", type: :exclusive, mfa: {Restate.TestServices.MapObject, :set, 2}},
+        %{name: "get", type: :shared, mfa: {Restate.TestServices.MapObject, :get, 2}},
+        %{name: "clearAll", type: :exclusive, mfa: {Restate.TestServices.MapObject, :clear_all, 2}}
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "Proxy",
       type: :service,
       handlers: [
