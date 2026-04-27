@@ -32,7 +32,7 @@ defmodule Restate.TestServices.Proxy do
   response bytes (as an array of byte-integers).
   """
   def call(%Context{} = ctx, %{"serviceName" => service, "handlerName" => handler} = req) do
-    bytes = result_to_binary(Context.call(ctx, service, handler, message_to_binary(req), opts(req)))
+    bytes = result_to_binary(Context.call(ctx, service, handler, {:raw, message_to_binary(req)}, opts(req)))
     :binary.bin_to_list(bytes)
   end
 
@@ -43,7 +43,7 @@ defmodule Restate.TestServices.Proxy do
         %Context{} = ctx,
         %{"serviceName" => service, "handlerName" => handler} = req
       ) do
-    Context.send(ctx, service, handler, message_to_binary(req), opts(req))
+    Context.send(ctx, service, handler, {:raw, message_to_binary(req)}, opts(req))
   end
 
   @doc """
@@ -69,13 +69,12 @@ defmodule Restate.TestServices.Proxy do
   defp message_to_binary(%{"message" => list}) when is_list(list), do: :binary.list_to_bin(list)
   defp message_to_binary(_), do: <<>>
 
-  defp result_to_binary(bytes) when is_binary(bytes), do: bytes
-
-  # The called handler's response was JSON — call/5 decoded it. If the
-  # caller wants the raw bytes, re-encode. We don't have access to the
-  # original wire bytes here, so we re-encode the term. For the
-  # conformance Proxy test, the called handler's response is itself a
-  # JSON object that the test client decodes again.
+  # `Restate.Context.call/5` Jason-decodes the response, so by the time we
+  # see it the wire bytes are gone. Re-encode the term so the test client
+  # gets back the original JSON shape (e.g. a string is `"PING"` with
+  # surrounding quotes, not bare `PING`). Don't short-circuit on binaries:
+  # an Elixir string is also a binary, and the test expects it to come
+  # back as a JSON string literal.
   defp result_to_binary(term), do: Jason.encode!(term)
 
   defp opts(%{"virtualObjectKey" => key} = req) when is_binary(key) do

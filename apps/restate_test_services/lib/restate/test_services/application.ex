@@ -37,6 +37,40 @@ defmodule Restate.TestServices.Application do
     })
 
     Restate.Server.Registry.register_service(%{
+      name: "CancelTestRunner",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "startTest",
+          type: :exclusive,
+          mfa: {Restate.TestServices.CancelTest.Runner, :start_test, 2}
+        },
+        %{
+          name: "verifyTest",
+          type: :exclusive,
+          mfa: {Restate.TestServices.CancelTest.Runner, :verify_test, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "CancelTestBlockingService",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "block",
+          type: :exclusive,
+          mfa: {Restate.TestServices.CancelTest.BlockingService, :block, 2}
+        },
+        %{
+          name: "isUnlocked",
+          type: :exclusive,
+          mfa: {Restate.TestServices.CancelTest.BlockingService, :is_unlocked, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "AwakeableHolder",
       type: :virtual_object,
       handlers: [
@@ -139,6 +173,11 @@ defmodule Restate.TestServices.Application do
           name: "sleepConcurrently",
           type: nil,
           mfa: {Restate.TestServices.TestUtilsService, :sleep_concurrently, 2}
+        },
+        %{
+          name: "cancelInvocation",
+          type: nil,
+          mfa: {Restate.TestServices.TestUtilsService, :cancel_invocation, 2}
         }
       ]
     })

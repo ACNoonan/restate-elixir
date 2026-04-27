@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: v0.1 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **19 / 19 official `sdk-test-suite` conformance tests passing across all targeted classes; 0 SDK bugs.** No Hex release yet.
+> **Status: v0.2 cancellation-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **34 / 34 official `sdk-test-suite` conformance tests passing across all targeted classes, including the v0.2 cancellation surface (`KillInvocation`, `Cancellation × 6`).** No Hex release yet.
 
 ## Why this exists
 
@@ -117,8 +117,8 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | `NoisyNeighbor` + `Drainable` demo handlers (Demos 2 + 3) | ✓ |
 | `docker compose` dev loop against `restate:1.6.2` | ✓ |
 | `kind` cluster test bed with self-contained manifests | ✓ |
+| Cancellation (`cancelInvocation` + built-in CANCEL signal id 1) | ✓ (v0.2) |
 | Run retry policies (max-attempts / backoff) | — v0.2 |
-| Cancellation (`cancelInvocation` + cancel signal) | — v0.2 |
 | Awaitable combinators (`Awaitable.any` / `Awaitable.all`) | — v0.2 |
 | Lazy state (`GetLazyStateCommandMessage`) | — v0.2 |
 | Full HTTP/2 same-stream suspend/resume | — v0.2 |
@@ -129,26 +129,34 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 
 Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk-test-suite/releases/tag/v4.1) (the official Restate conformance harness, also used by the Java/TS/Python/Go SDKs in CI).
 
-| Test class (suite: `alwaysSuspending`) | Result | Notes |
+**v0.2: 34 / 34 across every targeted test class** — all of v0.1's `alwaysSuspending` matrix plus the v0.2 cancellation surface (`KillInvocation` + `Cancellation × {CALL, SLEEP, AWAKEABLE} × {Context, AdminAPI}`).
+
+| Test class (suite) | Result | Notes |
 |---|---|---|
-| `State.add` | ✅ | Counter VirtualObject — sequential `add(N)` round-trips, state persists |
-| `State.proxyOneWayAdd` | ✅ | exercises `ctx.send` via the Proxy service |
-| `State.listStateAndClearAll` | ✅ | exercises `MapObject` + `clear_all_state` + `state_keys` |
-| `Sleep.sleep` | ✅ | basic suspend/resume |
-| `Sleep.manySleeps` | ✅ | **50 invocations × 20 sleeps each** = 1,000 total, each one a full suspension cycle |
+| `State.add` (alwaysSuspending) | ✅ | Counter VirtualObject — sequential `add(N)` round-trips, state persists |
+| `State.proxyOneWayAdd` (alwaysSuspending) | ✅ | exercises `ctx.send` via the Proxy service |
+| `State.listStateAndClearAll` (alwaysSuspending) | ✅ | exercises `MapObject` + `clear_all_state` + `state_keys` |
+| `Sleep.sleep` (alwaysSuspending) | ✅ | basic suspend/resume |
+| `Sleep.manySleeps` (alwaysSuspending) | ✅ | **50 invocations × 20 sleeps each** = 1,000 total, each one a full suspension cycle |
 | `SleepWithFailures.sleepAndTerminateServiceEndpoint` | ✅ | service container `SIGTERM` mid-sleep |
 | `SleepWithFailures.sleepAndKillServiceEndpoint` | ✅ | service container `SIGKILL` mid-sleep |
 | `KillRuntime.startAndKillRuntimeRetainsTheState` | ✅ | `restate-server` container `SIGKILL` between calls |
 | `StopRuntime.startAndStopRuntimeRetainsTheState` | ✅ | `restate-server` container `SIGTERM` between calls |
-| `UserErrors.invokeTerminallyFailingCall` | ✅ | terminal failure surfaces with message |
-| `UserErrors.invokeTerminallyFailingCallWithMetadata` | ✅ | terminal failure with `Map<String,String>` metadata |
+| `UserErrors.invokeTerminallyFailingCall(WithMetadata)` (×2) | ✅ | terminal failure surfaces with message + `Map<String,String>` metadata |
 | `UserErrors.failSeveralTimes(WithMetadata)` (×2) | ✅ | endpoint stays healthy across repeated failures |
 | `UserErrors.setStateThenFailShouldPersistState` | ✅ | state-mutating commands committed before terminal failure |
 | `UserErrors.invocationWithEventualSuccess` | ✅ | retry behavior on non-terminal exceptions |
 | `UserErrors.internalCallFailurePropagation(WithMetadata)` (×2) | ✅ | exercises terminal-error propagation through `ctx.call` |
 | `UserErrors.sideEffectWithTerminalError(WithMetadata)` (×2) | ✅ | exercises terminal failure inside `ctx.run` |
+| `NonDeterminismErrors.method` (×4) | ✅ | journal-mismatch detection across `setDifferentKey`, `eitherSleepOrCall`, `callDifferentMethod`, `backgroundInvokeWithDifferentTargets` |
+| `ServiceToServiceCommunication.regularCall` | ✅ | request-response `ctx.call` round-trip |
+| `ServiceToServiceCommunication.callWithIdempotencyKey` | ✅ | de-duped retry via idempotency key |
+| `ServiceToServiceCommunication.oneWayCall(WithIdempotencyKey)` (×2) | ✅ | fire-and-forget `ctx.send` |
+| `KillInvocation.kill` (default) | ✅ **v0.2** | admin-API kill cascades through `ctx.call` chain; lock released |
+| `Cancellation.cancelFromContext` × `{CALL, SLEEP, AWAKEABLE}` | ✅ **v0.2** | SDK-side `ctx.cancel_invocation` interrupts each blocking-op shape |
+| `Cancellation.cancelFromAdminAPI` × `{CALL, SLEEP, AWAKEABLE}` | ✅ **v0.2** | admin-API cancel interrupts each blocking-op shape |
 
-**19 / 19 across all targeted test classes; 0 SDK bugs found across the entire v0.1 build.**
+**34 / 34 across all targeted test classes.** The cancellation cascade (next blocking op of the runner *and* its in-flight callees) is exercised end-to-end — Restate's runtime does not auto-propagate cancel through the call tree, so the SDK emits an explicit `SendSignalCommand{idx: 1}` to outstanding callees alongside its own terminal output.
 
 The four cells of the durability matrix are all green:
 

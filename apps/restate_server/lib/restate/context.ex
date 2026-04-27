@@ -87,7 +87,10 @@ defmodule Restate.Context do
   """
   @spec sleep(t(), non_neg_integer()) :: :ok
   def sleep(%__MODULE__{pid: pid}, duration_ms) when is_integer(duration_ms) and duration_ms >= 0 do
-    GenServer.call(pid, {:sleep, duration_ms}, :infinity)
+    case GenServer.call(pid, {:sleep, duration_ms}, :infinity) do
+      :ok -> :ok
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
   end
 
   @doc """
@@ -159,19 +162,22 @@ defmodule Restate.Context do
   @spec send(t(), String.t(), String.t(), term(), keyword()) :: String.t()
   def send(%__MODULE__{pid: pid}, service, handler, parameter, opts \\ [])
       when is_binary(service) and is_binary(handler) do
-    GenServer.call(
-      pid,
-      {:send,
-       %{
-         service: service,
-         handler: handler,
-         parameter: encode_parameter(parameter),
-         key: Keyword.get(opts, :key, ""),
-         idempotency_key: Keyword.get(opts, :idempotency_key),
-         invoke_at_ms: Keyword.get(opts, :invoke_at_ms, 0)
-       }},
-      :infinity
-    )
+    case GenServer.call(
+           pid,
+           {:send,
+            %{
+              service: service,
+              handler: handler,
+              parameter: encode_parameter(parameter),
+              key: Keyword.get(opts, :key, ""),
+              idempotency_key: Keyword.get(opts, :idempotency_key),
+              invoke_at_ms: Keyword.get(opts, :invoke_at_ms, 0)
+            }},
+           :infinity
+         ) do
+      {:ok, id} when is_binary(id) -> id
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
   end
 
   @doc """
@@ -210,7 +216,13 @@ defmodule Restate.Context do
     )
   end
 
-  defp encode_parameter(bytes) when is_binary(bytes), do: bytes
+  # JSON-encode the parameter. Elixir strings are binaries, so a naive
+  # binary-passthrough turns `"sign_1abc"` into the wire bytes `sign_1abc`
+  # (unquoted) — which `Jason.decode!` on the receiver chokes on. The
+  # `{:raw, bytes}` opt-out is for callers that already hold pre-encoded
+  # wire bytes (e.g. the Proxy conformance handler forwards opaque
+  # JSON-encoded byte arrays from the test client).
+  defp encode_parameter({:raw, bytes}) when is_binary(bytes), do: bytes
   defp encode_parameter(term), do: Jason.encode!(term)
 
   @doc """
@@ -281,6 +293,36 @@ defmodule Restate.Context do
   end
 
   @doc """
+  Cancel another invocation by id.
+
+  Emits a `SendSignalCommandMessage` carrying the built-in CANCEL
+  signal (`signal_id = 1` per `BuiltInSignal` in protocol.proto). The
+  Restate runtime delivers it to the target invocation; the target's
+  next suspending Context op (`sleep`, `call`, `send`, `await_awakeable`,
+  `run`) raises `Restate.TerminalError{code: 409, message: "cancelled"}`,
+  which terminates the target with `OutputCommandMessage{failure}`
+  and cascades through any in-flight call tree.
+
+  Fire-and-forget: returns `:ok` immediately. The cancellation does
+  not need to be acknowledged on this stream.
+
+  ## Use
+
+      id = Restate.Context.send(ctx, "Worker", "longJob", arg, key: "k")
+      # ... later ...
+      Restate.Context.cancel_invocation(ctx, id)
+
+  Use the invocation id returned by `send/5` (or by an out-of-band
+  admin call). For cancelling *this* invocation, raise
+  `Restate.TerminalError` directly — that's the same wire effect
+  with no round-trip.
+  """
+  @spec cancel_invocation(t(), String.t()) :: :ok
+  def cancel_invocation(%__MODULE__{pid: pid}, invocation_id) when is_binary(invocation_id) do
+    GenServer.call(pid, {:send_signal, invocation_id, 1})
+  end
+
+  @doc """
   Run a side-effecting function durably. The result is journaled so
   future replays of this invocation use the recorded value rather
   than re-executing the function.
@@ -318,6 +360,11 @@ defmodule Restate.Context do
         value
 
       {:replay_failure, %Restate.TerminalError{} = exc} ->
+        raise exc
+
+      {:terminal_error, %Restate.TerminalError{} = exc} ->
+        # Invocation cancelled before this run could execute — skip
+        # the side-effecting function and propagate the cancellation.
         raise exc
 
       {:execute, cid} ->

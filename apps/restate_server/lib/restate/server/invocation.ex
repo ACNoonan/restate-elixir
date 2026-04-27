@@ -75,7 +75,7 @@ defmodule Restate.Server.Invocation do
         {k, v}
       end
 
-    {recorded_commands, notifications, signal_notifications} =
+    {recorded_commands, notifications, signal_notifications, cancelled?} =
       partition_journal(replay_journal)
 
     initial_completion_id = max_completion_id_seen(replay_journal) + 1
@@ -121,6 +121,12 @@ defmodule Restate.Server.Invocation do
        signal_notifications: signal_notifications,
        next_completion_id: initial_completion_id,
        next_signal_id: initial_signal_id,
+       # Built-in CANCEL signal (signal_id = 1, per BuiltInSignal in
+       # protocol.proto:670). Once true, every subsequent suspending
+       # Context op raises Restate.TerminalError{code: 409}. Mirrors
+       # Java's `AsyncResultsState` reserving NotificationHandle 1 for
+       # the cancel signal.
+       cancelled?: cancelled?,
        emitted: [],
        # Tracking for ErrorMessage.related_command_* fields (mirrors
        # Java's Journal.lastCommandMetadata). Index starts at -1
@@ -210,7 +216,7 @@ defmodule Restate.Server.Invocation do
       :replaying ->
         with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.CallCommandMessage) do
           state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
-          handle_call_result(state, recorded.result_completion_id, from)
+          handle_call_result(state, recorded, from)
         else
           {:error, exc} -> finalize_journal_mismatch(state, exc, from)
         end
@@ -235,9 +241,19 @@ defmodule Restate.Server.Invocation do
           |> Map.put(:next_completion_id, cid_result + 1)
           |> track_command(cmd)
 
-        # REQUEST_RESPONSE: the result notification arrives on a
-        # subsequent invocation, so we suspend on cid_result.
-        suspend(state, cid_result, from)
+        if state.cancelled? do
+          # No invocation_id available yet (the runtime hasn't started
+          # the callee), so we can't propagate cancel to it from here.
+          # The callee will appear on the next replay's journal; that
+          # replay won't re-emit this CallCommand though, so we'll
+          # never get the chance. Restate's runtime is responsible for
+          # not spawning callees of an already-failed invocation.
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          # REQUEST_RESPONSE: the result notification arrives on a
+          # subsequent invocation, so we suspend on cid_result.
+          suspend(state, cid_result, from)
+        end
     end
   end
 
@@ -308,10 +324,14 @@ defmodule Restate.Server.Invocation do
           |> Map.put(:next_completion_id, cid_invok + 1)
           |> track_command(cmd)
 
-        # We block on the invocation_id notification so callers can
-        # use the spawned invocation's id (e.g. Proxy.oneWayCall
-        # returns it). REQUEST_RESPONSE mode: arrives on next replay.
-        suspend(state, cid_invok, from)
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          # We block on the invocation_id notification so callers can
+          # use the spawned invocation's id (e.g. Proxy.oneWayCall
+          # returns it). REQUEST_RESPONSE mode: arrives on next replay.
+          suspend(state, cid_invok, from)
+        end
     end
   end
 
@@ -347,9 +367,48 @@ defmodule Restate.Server.Invocation do
         {:reply, {:ok, nil}, state}
 
       :error ->
-        # Suspend on the signal_id; SuspensionMessage carries it in
-        # `waiting_signals` rather than `waiting_completions`.
-        suspend_signal(state, signal_id, from)
+        # Awaiting a signal that hasn't fired. If we're cancelled, this
+        # is the await site that picks up the cancellation — mirrors
+        # Java's "cancel raises at the next blocking op." A handler
+        # that's already past every blocking op (or whose every blocking
+        # op already has a completion in the journal) is allowed to
+        # finish normally.
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          # Suspend on the signal_id; SuspensionMessage carries it in
+          # `waiting_signals` rather than `waiting_completions`.
+          suspend_signal(state, signal_id, from)
+        end
+    end
+  end
+
+  def handle_call({:send_signal, target_invocation_id, signal_id}, from, state)
+      when is_binary(target_invocation_id) and is_integer(signal_id) do
+    cmd = %Pb.SendSignalCommandMessage{
+      target_invocation_id: target_invocation_id,
+      signal_id: {:idx, signal_id},
+      result: {:void, %Pb.Void{}}
+    }
+
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.SendSignalCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded)
+          {:reply, :ok, advance_phase(state)}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        # SendSignal is "Completable: No" per protocol.proto:482 — fire
+        # and forget, no completion ever arrives. We do not check
+        # cancellation here: a handler that's been cancelled mid-tree
+        # may still want to issue cancels to its children before
+        # exiting.
+        state = state |> Map.update!(:emitted, &[cmd | &1]) |> track_command(cmd)
+        {:reply, :ok, state}
     end
   end
 
@@ -381,6 +440,9 @@ defmodule Restate.Server.Invocation do
 
           case Map.fetch(state.notifications, recorded.result_completion_id) do
             {:ok, {:value, %Pb.Value{content: bytes}}} ->
+              # Replayed values stand even if cancel arrived this
+              # cycle — the side effect already happened in a previous
+              # invocation, the journal is the truth.
               {:reply, {:replay_value, decode_response(bytes)}, state}
 
             {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
@@ -390,8 +452,14 @@ defmodule Restate.Server.Invocation do
 
             :error ->
               # Run command in journal but no notification yet — the
-              # propose from a previous invocation didn't commit. Re-execute.
-              {:reply, {:execute, recorded.result_completion_id}, state}
+              # propose from a previous invocation didn't commit. Skip
+              # re-execution if cancelled so the side-effect doesn't
+              # run after the user asked us to stop.
+              if state.cancelled? do
+                {:reply, {:terminal_error, cancellation_error()}, state}
+              else
+                {:reply, {:execute, recorded.result_completion_id}, state}
+              end
           end
         else
           {:error, exc} -> finalize_journal_mismatch(state, exc, from)
@@ -408,7 +476,15 @@ defmodule Restate.Server.Invocation do
           |> Map.put(:next_completion_id, cid + 1)
           |> track_command(cmd)
 
-        {:reply, {:execute, cid}, state}
+        if state.cancelled? do
+          # Don't run the side-effecting function. The journal
+          # carries the RunCommand but no completion will arrive,
+          # which is fine — the invocation is terminating with
+          # OutputCommandMessage{failure} on the next pass.
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          {:reply, {:execute, cid}, state}
+        end
     end
   end
 
@@ -442,12 +518,16 @@ defmodule Restate.Server.Invocation do
         with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.SleepCommandMessage) do
           state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
 
-          case Map.fetch(state.notifications, recorded.result_completion_id) do
-            {:ok, _} ->
+          cond do
+            Map.has_key?(state.notifications, recorded.result_completion_id) ->
               # Completion already in the replay journal — sleep returns now.
               {:reply, :ok, state}
 
-            :error ->
+            state.cancelled? ->
+              # Sleep would block, but cancel preempts.
+              {:reply, {:terminal_error, cancellation_error()}, state}
+
+            true ->
               # Recorded sleep, completion not yet stored. Suspend on this id.
               suspend(state, recorded.result_completion_id, from)
           end
@@ -469,9 +549,13 @@ defmodule Restate.Server.Invocation do
           |> Map.put(:next_completion_id, cid + 1)
           |> track_command(cmd)
 
-        # REQUEST_RESPONSE mode: no completion will arrive on this stream,
-        # so we suspend immediately on the freshly-emitted sleep id.
-        suspend(state, cid, from)
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          # REQUEST_RESPONSE mode: no completion will arrive on this stream,
+          # so we suspend immediately on the freshly-emitted sleep id.
+          suspend(state, cid, from)
+        end
     end
   end
 
@@ -539,29 +623,58 @@ defmodule Restate.Server.Invocation do
 
   # --- helpers ---
 
-  # Partition a post-Input replay journal into ordered commands and a
-  # completion-id-keyed notifications map. Entry-name commands like
+  # Built-in cancel signal index. `BuiltInSignal.CANCEL = 1` in
+  # protocol.proto:670. Java mirrors this as `CANCEL_SIGNAL_ID = 1` in
+  # `StateMachineImpl.java`.
+  @cancel_signal_id 1
+
+  # Canonical exception raised when a suspending op is hit on a
+  # cancelled invocation. 409 matches Restate's ABORTED convention
+  # used by the runtime when it propagates cancellation.
+  defp cancellation_error,
+    do: %Restate.TerminalError{code: 409, message: "cancelled"}
+
+  # Partition a post-Input replay journal into ordered commands, a
+  # completion-id-keyed notifications map, a (user) signal-id-keyed
+  # notifications map, and a cancellation flag. Entry-name commands like
   # OutputCommandMessage shouldn't appear in a replay (an Output ends the
   # invocation), but we tolerate them by keeping them in the command list.
+  #
+  # Signal id 1 is the built-in CANCEL signal — extracted into a flag
+  # rather than the user signal map so awakeable lookups (which use ids
+  # ≥ 17) never see it, and so the per-op cancel check is a single bool.
   defp partition_journal(frames) do
-    Enum.reduce(frames, {[], %{}, %{}}, fn %Frame{message: msg}, {cmds, notes, sigs} ->
+    Enum.reduce(frames, {[], %{}, %{}, false}, fn %Frame{message: msg}, {cmds, notes, sigs, cancelled?} ->
       cond do
         signal_notification?(msg) ->
-          {cmds, notes, Map.put(sigs, signal_notification_id(msg), signal_notification_result(msg))}
+          case signal_notification_id(msg) do
+            @cancel_signal_id ->
+              {cmds, notes, sigs, true}
+
+            id when is_integer(id) ->
+              {cmds, notes, Map.put(sigs, id, signal_notification_result(msg)), cancelled?}
+
+            nil ->
+              # Named-signal notification (signal_name oneof) — out of
+              # v0.2 scope. Drop defensively rather than crashing.
+              {cmds, notes, sigs, cancelled?}
+          end
 
         notification?(msg) ->
-          {cmds, Map.put(notes, msg.completion_id, notification_result(msg)), sigs}
+          {cmds, Map.put(notes, msg.completion_id, notification_result(msg)), sigs, cancelled?}
 
         command?(msg) ->
-          {[msg | cmds], notes, sigs}
+          {[msg | cmds], notes, sigs, cancelled?}
 
         true ->
           # Suspension/Error/End/CommandAck shouldn't show up in a replay
           # journal; ignore defensively.
-          {cmds, notes, sigs}
+          {cmds, notes, sigs, cancelled?}
       end
     end)
-    |> then(fn {cmds, notes, sigs} -> {Enum.reverse(cmds), notes, sigs} end)
+    |> then(fn {cmds, notes, sigs, cancelled?} ->
+      {Enum.reverse(cmds), notes, sigs, cancelled?}
+    end)
   end
 
   # SignalNotificationMessage uses oneof id: completion_id | signal_id |
@@ -601,11 +714,12 @@ defmodule Restate.Server.Invocation do
   # Returns 0 for an empty journal so callers can use `+1` to seed a
   # one-based counter.
   #
-  # Note for v0.2: signal IDs reserve slots 1–16 per Java's
-  # `Journal.signalIndex = 17` (sdk-java/.../statemachine/Journal.java:27).
-  # When SendSignalCommandMessage support lands, signal-id allocation
-  # must start at 17, not at 1; completion-ids share the slot 1+ range
-  # because they're a different namespace.
+  # Signal IDs are a separate namespace: slots 1–16 are reserved for
+  # built-in signals (CANCEL = 1; see protocol.proto:670) and user
+  # allocations start at 17 to match `Journal.signalIndex` in
+  # `sdk-java/.../statemachine/Journal.java`. Completion IDs share
+  # the 1+ range with signals only nominally — they never collide
+  # because they live on different oneof branches of NotificationTemplate.
   defp max_completion_id_seen(frames) do
     frames
     |> Enum.flat_map(&extract_completion_ids/1)
@@ -646,13 +760,24 @@ defmodule Restate.Server.Invocation do
      }}
   end
 
-  # ctx.call replay/processing — once we've located the recorded
-  # command (or emitted a fresh one), check whether the target's
-  # result is already in the notifications map. Replies to the
-  # caller with a tagged tuple; `Restate.Context.call` raises on
-  # `:terminal_error` so user code sees an exception, not a tuple.
-  defp handle_call_result(state, result_completion_id, from) do
-    case Map.fetch(state.notifications, result_completion_id) do
+  # ctx.call replay path — once the recorded CallCommand is popped,
+  # check whether the target's result is already in the notifications
+  # map. Replies to the caller with a tagged tuple;
+  # `Restate.Context.call` raises on `:terminal_error` so user code
+  # sees an exception, not a tuple.
+  #
+  # Cancel raises at this await site only when the call result is NOT
+  # in the journal — i.e. only when the call is the "current blocking
+  # op" the cancel should interrupt. If the result is already there,
+  # we return it; cancel will fire at the next still-blocking op (or
+  # the handler runs to completion). When we do raise, we first
+  # propagate the cancel to the callee — Restate's runtime does not
+  # auto-cascade `cancelInvocation` through the call tree, so without
+  # this the BlockingService would keep running until its own
+  # blocking op completed naturally. Verified against `restate-server`
+  # 1.6.3 by inspecting NotifySignal events in the runtime log.
+  defp handle_call_result(state, %Pb.CallCommandMessage{} = recorded, from) do
+    case Map.fetch(state.notifications, recorded.result_completion_id) do
       {:ok, {:value, %Pb.Value{content: bytes}}} ->
         {:reply, {:ok, decode_response(bytes)}, state}
 
@@ -662,20 +787,55 @@ defmodule Restate.Server.Invocation do
         {:reply, {:terminal_error, exc}, state}
 
       :error ->
-        # Result not in journal yet — suspend on the result completion id.
-        suspend(state, result_completion_id, from)
+        if state.cancelled? do
+          state = propagate_cancel_to_callee(state, recorded.invocation_id_notification_idx)
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          # Result not in journal yet — suspend on the result completion id.
+          suspend(state, recorded.result_completion_id, from)
+        end
+    end
+  end
+
+  # Look up the callee's invocation_id from the
+  # CallInvocationIdCompletionNotification (if the runtime has
+  # delivered it) and emit a SendSignal(idx=1, void) targeting it.
+  # Goes into `state.emitted` so the cascade ships in the same wire
+  # response as the OutputCommandMessage{failure}.
+  defp propagate_cancel_to_callee(state, invocation_id_notification_idx) do
+    case Map.get(state.notifications, invocation_id_notification_idx) do
+      {:invocation_id, target_id} when is_binary(target_id) and byte_size(target_id) > 0 ->
+        cmd = %Pb.SendSignalCommandMessage{
+          target_invocation_id: target_id,
+          signal_id: {:idx, @cancel_signal_id},
+          result: {:void, %Pb.Void{}}
+        }
+
+        %{state | emitted: [cmd | state.emitted]}
+
+      _ ->
+        # Runtime hasn't reported the callee's id yet — nothing to
+        # cancel. The callee is either not started or will start on a
+        # journal we never see again.
+        state
     end
   end
 
   # ctx.send replay/processing — we wait on the invocation_id notification
   # so callers can use the id of the spawned invocation.
   defp handle_send_invocation_id(state, invocation_id_completion_id, from) do
-    case Map.fetch(state.notifications, invocation_id_completion_id) do
-      {:ok, {:invocation_id, id}} when is_binary(id) ->
-        {:reply, id, state}
+    cond do
+      state.cancelled? ->
+        {:reply, {:terminal_error, cancellation_error()}, state}
 
-      :error ->
-        suspend(state, invocation_id_completion_id, from)
+      true ->
+        case Map.fetch(state.notifications, invocation_id_completion_id) do
+          {:ok, {:invocation_id, id}} when is_binary(id) ->
+            {:reply, {:ok, id}, state}
+
+          :error ->
+            suspend(state, invocation_id_completion_id, from)
+        end
     end
   end
 
@@ -727,9 +887,14 @@ defmodule Restate.Server.Invocation do
 
   # Like suspend/3 but uses waiting_signals instead of waiting_completions.
   # Awakeables are signal-id-based per the V5 spec; the runtime resumes
-  # the invocation when any of the waiting signals fires.
+  # the invocation when any of the waiting signals fires. We also list
+  # signal_id 1 so cancel can interrupt an awakeable wait — see
+  # `suspend/3` for the rationale.
   defp suspend_signal(state, signal_id, _from) do
-    suspension = %Pb.SuspensionMessage{waiting_signals: [signal_id]}
+    suspension = %Pb.SuspensionMessage{
+      waiting_signals: Enum.uniq([signal_id, @cancel_signal_id])
+    }
+
     body = encode_response(state.emitted, [suspension])
     finalize(body, state)
   end
@@ -793,8 +958,21 @@ defmodule Restate.Server.Invocation do
   # un-replied-to: when we exit, the linked handler process dies and the
   # caller never receives a reply (which is what we want — handler
   # execution is over for this invocation).
+  #
+  # Every suspension also lists signal_id 1 (built-in CANCEL) in
+  # `waiting_signals`. Without it, Restate would only re-invoke when
+  # the user-level completion fires, so a cancel arriving while we're
+  # blocked on a long sleep / outstanding call would never wake us
+  # up — the SDK-side cancel-handling code is correct, but it never
+  # gets a chance to run. Listing 1 unconditionally is what every other
+  # SDK does (verified against `sdk-java`'s suspension paths) and
+  # tracks the V5 spec note in `protocol.proto:670`.
   defp suspend(state, completion_id, _from) do
-    suspension = %Pb.SuspensionMessage{waiting_completions: [completion_id]}
+    suspension = %Pb.SuspensionMessage{
+      waiting_completions: [completion_id],
+      waiting_signals: [@cancel_signal_id]
+    }
+
     body = encode_response(state.emitted, [suspension])
     finalize(body, state)
   end

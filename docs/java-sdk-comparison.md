@@ -393,8 +393,30 @@ the Java read makes concrete:
   `proposeRunCompletion` paths handle exponential backoff,
   max-attempts, terminal-on-exhaust. Demo 5 (sustained-load soak)
   exercises this indirectly.
-- **Cancellation signal (`cancelInvocation`).** Java has signal IDs
-  1–16 reserved with the cancel signal at a fixed slot.
+- **Cancellation signal (`cancelInvocation`).** ✓ Landed (v0.2).
+  Built-in CANCEL signal lives at signal_id 1 (per
+  `BuiltInSignal.CANCEL` in protocol.proto:670 and Java's
+  `CANCEL_SIGNAL_ID = 1` in `StateMachineImpl.java`). Detected at
+  journal-partition time, raised as
+  `Restate.TerminalError{code: 409, message: "cancelled"}` from the
+  next blocking op whose completion isn't already in the journal —
+  matches Java's "cancel raises at the next still-blocking await"
+  semantic so handlers can replay through completed work before the
+  cancellation fires. `Restate.Context.cancel_invocation/2` issues a
+  `SendSignalCommandMessage{idx: 1, void}` for handler-side
+  cancellation. Conformance: `KillInvocation` + 6 `Cancellation`
+  cases (CALL/SLEEP/AWAKEABLE × Context/AdminAPI), all green.
+
+  **One non-obvious gap surfaced by conformance:** `restate-server`
+  1.6.3 does **not** auto-propagate `cancelInvocation` through the
+  `ctx.call` chain — every `NotifySignal` event in the runtime log
+  targets only the directly-cancelled invocation. Java SDK works
+  around this by emitting an explicit `SendSignalCommand{target:
+  callee_invocation_id, idx: 1}` whenever cancel hits a `ctx.call`
+  await site. We mirror this in
+  `Invocation.propagate_cancel_to_callee/2` — without it the
+  callee keeps running until its own blocking op completes naturally
+  and the test harness times out.
 - **Workflow service type.** PLAN.md scopes this out; Java's
   `BlockAndWaitWorkflow` shows the lifecycle expectations.
 

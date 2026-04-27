@@ -10,16 +10,16 @@ defmodule Restate.TestServices.TestUtilsService do
 
   ### Implemented
 
-    * `echo`           — round-trip a string
-    * `uppercaseEcho`  — round-trip a string, uppercased
+    * `echo`             — round-trip a string
+    * `uppercaseEcho`    — round-trip a string, uppercased
     * `sleepConcurrently` — create N timers and wait on them all
+    * `cancelInvocation` — emit a CANCEL signal at the given invocation id
 
   ### Not yet implemented (omitted from the registration map)
 
     * `echoHeaders`              — needs request-header plumbing on the Context
     * `rawEcho`                  — needs raw-bytes I/O (handler currently assumes JSON)
     * `countExecutedSideEffects` — needs `ctx.run` (Run command pair, post-v0.1)
-    * `cancelInvocation`         — needs cancel + invocation handle support
 
   ### sleepConcurrently note
 
@@ -43,6 +43,11 @@ defmodule Restate.TestServices.TestUtilsService do
       Context.sleep(ctx, ms)
     end)
 
+    nil
+  end
+
+  def cancel_invocation(%Context{} = ctx, invocation_id) when is_binary(invocation_id) do
+    Context.cancel_invocation(ctx, invocation_id)
     nil
   end
 end

@@ -21,20 +21,23 @@ defmodule Restate.TestServices.KillTest do
   cancel its outstanding ctx.call to the singleton → cancel the
   singleton's outstanding `await_awakeable`.
 
-  ## Cancellation gap (v0.2)
+  ## Cancellation propagation
 
-  This test does not yet pass. Restate's cancel-signal mechanism
-  uses the reserved signal-id 1 (per
-  `AsyncResultsState.java:31`) — when an invocation is killed the
-  runtime delivers a `SignalNotificationMessage{signal_id: 1}` to
-  every awaiting invocation in the tree. Our SDK does not yet handle
-  the cancel signal: receiving signal_id 1 should raise a
-  cancellation exception inside `await_awakeable` / `call` /
-  `await_call_result`, which propagates up to the user handler.
+  Restate's cancel-signal mechanism uses the reserved signal-id 1
+  (per `BuiltInSignal.CANCEL` in protocol.proto:670). When an
+  invocation is killed via the admin API, the runtime delivers a
+  `SignalNotificationMessage{signal_id: 1}` to every awaiting
+  invocation in the call tree. The SDK detects it during journal
+  partitioning and raises `Restate.TerminalError{code: 409,
+  message: "cancelled"}` from the next suspending Context op, which
+  propagates up the user handler and out as
+  `OutputCommandMessage{failure}`. The runtime cascades the kill
+  down through any in-flight callees (here: runner → singleton).
 
-  Scaffolded here so the test runner discovers the services
-  (no more 404), and so the cancellation-handling work in v0.2 has
-  a clear set of receiving handlers to wire into.
+  After the kill cascades, the singleton's VirtualObject key is
+  released, so `isUnlocked` (a fresh invocation on the same key)
+  acquires the lock and returns `true` — that's the assertion the
+  conformance test makes.
   """
 
   defmodule Runner do

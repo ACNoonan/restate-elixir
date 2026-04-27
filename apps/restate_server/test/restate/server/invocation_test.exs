@@ -314,7 +314,7 @@ defmodule Restate.Server.InvocationTest do
     test "awakeable id uses sign_1 prefix (V5 signal-id routing)" do
       assert [
                %Pb.CompleteAwakeableCommandMessage{awakeable_id: id},
-               %Pb.SuspensionMessage{waiting_signals: [signal_id]}
+               %Pb.SuspensionMessage{waiting_signals: signals}
              ] =
                run(
                  %Pb.StartMessage{id: <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>},
@@ -325,8 +325,11 @@ defmodule Restate.Server.InvocationTest do
       assert String.starts_with?(id, "sign_1")
       # First awakeable in any invocation must allocate signal_id 17 —
       # 1–16 are reserved for built-in signals (cancel, etc.) per
-      # Restate's runtime convention.
-      assert signal_id == 17
+      # Restate's runtime convention. Cancel-signal-id 1 is also listed
+      # so the runtime can interrupt this wait if the invocation is
+      # killed.
+      assert 17 in signals
+      assert 1 in signals
     end
 
     test "replay with signal notification: await returns the value" do
@@ -507,6 +510,260 @@ defmodule Restate.Server.InvocationTest do
 
       assert [%Pb.SetStateCommandMessage{value: %Pb.Value{content: only}}] = set_states
       assert Jason.decode!(only) == "after_sleep"
+    end
+  end
+
+  describe "cancellation (built-in CANCEL signal, signal_id = 1)" do
+    defmodule Sleeper do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.set_state(ctx, "step", "started")
+        Context.sleep(ctx, 10_000)
+        Context.set_state(ctx, "step", "after_sleep")
+        :ok
+      end
+    end
+
+    defmodule Awaiter do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        {_id, handle} = Context.awakeable(ctx)
+        Context.await_awakeable(ctx, handle)
+      end
+    end
+
+    defmodule Caller2 do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.call(ctx, "Counter", "add", 5, key: "k1")
+      end
+    end
+
+    defmodule Cleanup do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        try do
+          Context.sleep(ctx, 10_000)
+        rescue
+          _ in Restate.TerminalError ->
+            Context.set_state(ctx, "cleaned_up", true)
+            reraise Restate.TerminalError, [code: 409, message: "cancelled"], __STACKTRACE__
+        end
+      end
+    end
+
+    defmodule Canceller do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.cancel_invocation(ctx, "inv_target_xyz")
+        :ok
+      end
+    end
+
+    test "cancel signal during sleep replay: raises terminal 409, no Suspension" do
+      replay = [
+        %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: ~s("started")}},
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      start = %Pb.StartMessage{
+        state_map: [%Pb.StartMessage.StateEntry{key: "step", value: ~s("started")}]
+      }
+
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(start, nil, {Sleeper, :handle, 2}, replay)
+    end
+
+    test "completion-already-present beats cancel: sleep returns normally, then handler finishes" do
+      # Java's semantic: cancel only raises when the await would
+      # otherwise block. If the SleepCompletion is already in the
+      # journal, return it and let the handler proceed; cancel will
+      # fire at the next still-blocking op (or, if there isn't one,
+      # the handler runs to completion). This is what makes
+      # cancel propagation through a call tree work — without it, the
+      # outer handler can't replay past its first awakeable to even
+      # reach the inner ctx.call site.
+      replay = [
+        %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: ~s("started")}},
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      start = %Pb.StartMessage{
+        state_map: [%Pb.StartMessage.StateEntry{key: "step", value: ~s("started")}]
+      }
+
+      # Sleep returns, then the second SetState fires, then the handler
+      # returns :ok. No 409 raised because there's no remaining
+      # blocking op for cancel to interrupt.
+      assert [
+               %Pb.SetStateCommandMessage{key: "step", value: %Pb.Value{content: after_sleep}},
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{}}},
+               %Pb.EndMessage{}
+             ] = run(start, nil, {Sleeper, :handle, 2}, replay)
+
+      assert Jason.decode!(after_sleep) == "after_sleep"
+    end
+
+    test "user signal present + cancel: await returns the value (cancel parks for next blocking op)" do
+      replay = [
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 17},
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"value" => 42})}}
+        },
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      # Awaiter has just one await — it returns the value and the
+      # handler completes normally.
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11>>},
+                 nil,
+                 {Awaiter, :handle, 2},
+                 replay
+               )
+
+      assert Jason.decode!(out) == %{"value" => 42}
+    end
+
+    test "ctx.call result present + cancel: returns the result (cancel parks)" do
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Counter",
+          handler_name: "add",
+          key: "k1",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallCompletionNotificationMessage{
+          completion_id: 2,
+          result: {:value, %Pb.Value{content: Jason.encode!(%{"newValue" => 5})}}
+        },
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Caller2, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"newValue" => 5}
+    end
+
+    test "cancel propagates to outstanding ctx.call: emits SendSignal(idx=1) to callee" do
+      # The call's invocation_id is in the journal but its result is
+      # NOT — that's the "outstanding call" shape. On replay we see
+      # the cancel signal, look up the callee's id from the
+      # CallInvocationId notification, and emit a
+      # SendSignalCommandMessage{idx: 1} so the callee gets cancelled
+      # too. Restate's runtime does not auto-cascade cancel through
+      # the call tree, so this is what makes "kill propagates" actually
+      # work.
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Counter",
+          handler_name: "add",
+          key: "k1",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallInvocationIdCompletionNotificationMessage{
+          completion_id: 1,
+          invocation_id: "inv_callee_xyz"
+        },
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.SendSignalCommandMessage{
+                 target_invocation_id: "inv_callee_xyz",
+                 signal_id: {:idx, 1},
+                 result: {:void, %Pb.Void{}}
+               },
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Caller2, :handle, 2}, replay)
+    end
+
+    test "rescue Restate.TerminalError lets the handler do cleanup before terminating" do
+      # Mirrors the Java behaviour: cancel is a regular TerminalException at
+      # the await site, so handlers can `try/rescue` to release locks /
+      # checkpoint state before the invocation ends.
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.SetStateCommandMessage{
+                 key: "cleaned_up",
+                 value: %Pb.Value{content: ~s(true)}
+               },
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Cleanup, :handle, 2}, replay)
+    end
+
+    test "Context.cancel_invocation/2 emits SendSignalCommandMessage{idx: 1, void}" do
+      assert [
+               %Pb.SendSignalCommandMessage{
+                 target_invocation_id: "inv_target_xyz",
+                 signal_id: {:idx, 1},
+                 result: {:void, %Pb.Void{}}
+               },
+               %Pb.OutputCommandMessage{},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {Canceller, :handle, 2})
+    end
+
+    test "SendSignal in :replaying is consumed silently — not re-emitted" do
+      replay = [
+        %Pb.SendSignalCommandMessage{
+          target_invocation_id: "inv_target_xyz",
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [%Pb.OutputCommandMessage{}, %Pb.EndMessage{}] =
+               run(%Pb.StartMessage{}, nil, {Canceller, :handle, 2}, replay)
     end
   end
 end
