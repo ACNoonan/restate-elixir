@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: v0.2 cancellation + combinators + run-retry-policies complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **42 / 42 official `sdk-test-suite` conformance tests passing across all targeted classes, including the v0.2 cancellation surface, awaitable combinators, and run retry policies.** Workflow service type is the remaining v0.2-deferred class. No Hex release yet.
+> **Status: v0.2 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **43 / 43 official `sdk-test-suite` conformance tests passing across all targeted classes — full clean sweep across cancellation, awaitable combinators, run retry policies, and Workflow service type with durable promises.** No Hex release yet.
 
 ## Why this exists
 
@@ -121,16 +121,16 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | Awaitable combinators (`Awaitable.any` / `Awaitable.all` / `Awaitable.await`) | ✓ (v0.2) |
 | `ctx.run` retry policies (max-attempts / backoff via `Restate.RetryPolicy`) | ✓ (v0.2) |
 | `ctx.run` flush (suspend-after-propose for durability) | ✓ (v0.2) |
-| Lazy state (`GetLazyStateCommandMessage`) | — v0.2 |
-| Full HTTP/2 same-stream suspend/resume | — v0.2 |
-| Workflow service type | — v0.2 |
+| Workflow service type + durable promises (`get_promise` / `peek_promise` / `complete_promise` / `reject_promise`) | ✓ (v0.2) |
+| Lazy state (`GetLazyStateCommandMessage`) | — v0.3 |
+| Full HTTP/2 same-stream suspend/resume | — v0.3 |
 | Graceful drain on `SIGTERM` (Demo 3 in [PLAN.md](./PLAN.md#demos-beyond-the-mvp--making-the-beam-case)) | — v0.2 |
 
 ## Conformance status
 
 Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk-test-suite/releases/tag/v4.1) (the official Restate conformance harness, also used by the Java/TS/Python/Go SDKs in CI).
 
-**v0.2: 42 / 42 across every targeted test class** — v0.1's `alwaysSuspending` matrix plus the v0.2 cancellation surface (`KillInvocation` + `Cancellation × 6`), awaitable combinators (`Combinators × 3`), `ctx.run` retry policies (`RunRetry × 3` + `RunFlush × 1`), and the `oneWayCallWithDelay` proxy fix. The only remaining `alwaysSuspending` failure is `WorkflowAPI.setAndResolve` — Workflow service type is deliberately deferred.
+**v0.2: 43 / 43 across every targeted test class — full clean sweep.** v0.1's `alwaysSuspending` matrix plus the v0.2 cancellation surface (`KillInvocation` + `Cancellation × 6`), awaitable combinators (`Combinators × 3`), `ctx.run` retry policies (`RunRetry × 3` + `RunFlush × 1`), Workflow service type with durable promises (`WorkflowAPI.setAndResolve`), and the `oneWayCallWithDelay` proxy fix. Zero failing or deferred classes in the targeted test set.
 
 | Test class (suite) | Result | Notes |
 |---|---|---|
@@ -164,8 +164,9 @@ Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk
 | `RunRetry.withExhaustedAttempts` | ✅ **v0.2** | `max_attempts: 3` exhausts, terminal proposed, handler reads counter |
 | `RunFlush.flush` | ✅ **v0.2** | `ctx.run` suspends after `ProposeRunCompletion`; final replay returns 0 |
 | `ServiceToServiceCommunication.oneWayCallWithDelay` | ✅ **v0.2** | `delayMillis` forwarded as `OneWayCallCommandMessage.invoke_time` |
+| `WorkflowAPI.setAndResolve` | ✅ **v0.2** | one-shot Workflow + durable promise round-trip (`get_promise`, `peek_promise`, `complete_promise`) |
 
-**42 / 42 across all targeted test classes.** Notable v0.2 design points surfaced by the conformance suite:
+**43 / 43 across all targeted test classes.** Notable v0.2 design points surfaced by the conformance suite:
   * Cancel does not auto-cascade through `ctx.call` — the SDK emits an explicit `SendSignalCommand{idx: 1}` to the callee's invocation_id at the await site.
   * `ctx.run` retries happen synchronously inside the SDK with exponential backoff (matching `sdk-java`'s `RunState.java`); the runtime sees only the final `ProposeRunCompletion`. After exhaustion the SDK proposes a terminal failure so future replays are deterministic.
   * `ctx.run` suspends after each propose so the runtime can ack durable storage before the next side-effect runs — that's why `RunFlush` asserts the final response is 0 (every prior propose lives in the journal, none re-execute on the final replay).

@@ -170,6 +170,28 @@ defmodule Restate.TestServices.Application do
     })
 
     Restate.Server.Registry.register_service(%{
+      name: "BlockAndWaitWorkflow",
+      type: :workflow,
+      handlers: [
+        %{
+          name: "run",
+          type: :workflow,
+          mfa: {Restate.TestServices.BlockAndWaitWorkflow, :run, 2}
+        },
+        %{
+          name: "unblock",
+          type: :shared,
+          mfa: {Restate.TestServices.BlockAndWaitWorkflow, :unblock, 2}
+        },
+        %{
+          name: "getState",
+          type: :shared,
+          mfa: {Restate.TestServices.BlockAndWaitWorkflow, :get_state, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "VirtualObjectCommandInterpreter",
       type: :virtual_object,
       handlers: [

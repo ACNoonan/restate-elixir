@@ -488,6 +488,117 @@ defmodule Restate.Server.Invocation do
     end
   end
 
+  # --- Workflow durable promises ---
+  #
+  # `promise_get` blocks the workflow on a named durable promise (the
+  # promise is keyed by the workflow's StartMessage.key implicitly;
+  # `name` here is the promise label within that key's namespace).
+  # `promise_peek` is a non-blocking probe — the runtime always
+  # responds, with Void if the promise is unresolved or Value/Failure
+  # if it is. `promise_complete` resolves the promise from another
+  # handler (typically a @Shared handler running on the same workflow
+  # key). All three follow the same suspend-on-completion shape as
+  # ctx.sleep / ctx.call in REQUEST_RESPONSE mode.
+
+  def handle_call({:promise_get, name}, from, state) when is_binary(name) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.GetPromiseCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          handle_promise_value_result(state, recorded.result_completion_id, from)
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+        cmd = %Pb.GetPromiseCommandMessage{key: name, result_completion_id: cid}
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, cid, from)
+        end
+    end
+  end
+
+  def handle_call({:promise_peek, name}, from, state) when is_binary(name) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.PeekPromiseCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          handle_promise_peek_result(state, recorded.result_completion_id, from)
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+        cmd = %Pb.PeekPromiseCommandMessage{key: name, result_completion_id: cid}
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, cid, from)
+        end
+    end
+  end
+
+  def handle_call({:promise_complete, name, completion}, from, state) when is_binary(name) do
+    cmd_for = fn cid ->
+      base = %Pb.CompletePromiseCommandMessage{key: name, result_completion_id: cid}
+
+      case completion do
+        {:value, bytes} when is_binary(bytes) ->
+          %{base | completion: {:completion_value, %Pb.Value{content: bytes}}}
+
+        {:failure, code, message} when is_integer(code) and is_binary(message) ->
+          %{base | completion: {:completion_failure, %Pb.Failure{code: code, message: message}}}
+      end
+    end
+
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.CompletePromiseCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          handle_promise_complete_result(state, recorded.result_completion_id, from)
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+        cmd = cmd_for.(cid)
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, cid, from)
+        end
+    end
+  end
+
   # `propose_run_and_suspend` is the run-flush primitive. The SDK
   # proposes the value/failure and immediately suspends on the run's
   # `result_completion_id` — Restate stores the proposal as a
@@ -790,6 +901,9 @@ defmodule Restate.Server.Invocation do
   defp notification?(%Pb.CallCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.CallInvocationIdCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.RunCompletionNotificationMessage{}), do: true
+  defp notification?(%Pb.GetPromiseCompletionNotificationMessage{}), do: true
+  defp notification?(%Pb.PeekPromiseCompletionNotificationMessage{}), do: true
+  defp notification?(%Pb.CompletePromiseCompletionNotificationMessage{}), do: true
   defp notification?(_), do: false
 
   defp notification_result(%Pb.SleepCompletionNotificationMessage{void: void}), do: void || :void
@@ -914,6 +1028,89 @@ defmodule Restate.Server.Invocation do
         # cancel. The callee is either not started or will start on a
         # journal we never see again.
         state
+    end
+  end
+
+  # promise_get: same shape as a Value-or-Failure-only completable
+  # (no Void variant per the protocol — GetPromise blocks until
+  # actually resolved). Cancel preempts only when the journal has
+  # no completion for this op yet.
+  defp handle_promise_value_result(state, result_completion_id, from) do
+    case Map.fetch(state.notifications, result_completion_id) do
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        {:reply, {:ok, decode_response(bytes)}, state}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        exc = %Restate.TerminalError{
+          code: code,
+          message: message,
+          metadata: decode_failure_metadata(meta)
+        }
+
+        {:reply, {:terminal_error, exc}, state}
+
+      :error ->
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, result_completion_id, from)
+        end
+    end
+  end
+
+  # promise_peek: Void completion means "promise still unresolved" —
+  # surface as `:pending` to the caller, who decides whether to wait
+  # or branch.
+  defp handle_promise_peek_result(state, result_completion_id, from) do
+    case Map.fetch(state.notifications, result_completion_id) do
+      {:ok, {:void, _}} ->
+        {:reply, :pending, state}
+
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        {:reply, {:ok, decode_response(bytes)}, state}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        exc = %Restate.TerminalError{
+          code: code,
+          message: message,
+          metadata: decode_failure_metadata(meta)
+        }
+
+        {:reply, {:terminal_error, exc}, state}
+
+      :error ->
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, result_completion_id, from)
+        end
+    end
+  end
+
+  # promise_complete: the runtime acks the resolution with Void on
+  # success, Failure if e.g. the promise was already rejected and
+  # can't be resolved. Surface success as :ok, failure as
+  # {:terminal_error, exc}.
+  defp handle_promise_complete_result(state, result_completion_id, from) do
+    case Map.fetch(state.notifications, result_completion_id) do
+      {:ok, {:void, _}} ->
+        {:reply, :ok, state}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        exc = %Restate.TerminalError{
+          code: code,
+          message: message,
+          metadata: decode_failure_metadata(meta)
+        }
+
+        {:reply, {:terminal_error, exc}, state}
+
+      :error ->
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, result_completion_id, from)
+        end
     end
   end
 

@@ -448,8 +448,23 @@ the Java read makes concrete:
   `Invocation.propagate_cancel_to_callee/2` — without it the
   callee keeps running until its own blocking op completes naturally
   and the test harness times out.
-- **Workflow service type.** PLAN.md scopes this out; Java's
-  `BlockAndWaitWorkflow` shows the lifecycle expectations.
+- **Workflow service type + durable promises.** ✓ Landed (v0.2).
+  Three protocol commands wired in
+  [`Restate.Server.Invocation`](../apps/restate_server/lib/restate/server/invocation.ex)
+  (`promise_get` / `promise_peek` / `promise_complete`, ~80 LoC of
+  state-machine code) plus the user-facing API on
+  [`Restate.Context`](../apps/restate_server/lib/restate/context.ex)
+  (`get_promise/2`, `peek_promise/2`, `complete_promise/3`,
+  `reject_promise/4`). Conformance:
+  `WorkflowAPI.setAndResolve` green — exercises the full
+  `run` (workflow handler) → `getState` (shared) → `unblock` →
+  `attachSuspend` → `getOutputSuspend` → re-submit-returns-PREVIOUSLY_ACCEPTED
+  flow against the Java reference's `BlockAndWaitWorkflowImpl.kt`.
+
+  Workflow's one-shot-per-key idempotency (`PREVIOUSLY_ACCEPTED` on
+  re-invoke) is enforced by `restate-server` itself — the SDK only
+  declares `type: "WORKFLOW"` in the discovery manifest and the
+  runtime handles the lifecycle. Same shape as Java.
 
 ## What this comparison is for
 

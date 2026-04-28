@@ -1111,4 +1111,182 @@ defmodule Restate.Server.InvocationTest do
       assert Restate.RetryPolicy.exhausted?(p, 4)
     end
   end
+
+  describe "Workflow durable promises" do
+    defmodule PromiseGetter do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.get_promise(ctx, "p")
+      end
+    end
+
+    defmodule PromiseRoundTrip do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        v = Context.get_promise(ctx, "p")
+
+        case Context.peek_promise(ctx, "p") do
+          {:ok, _} ->
+            v
+
+          _ ->
+            raise Restate.TerminalError, message: "promise should be ready", code: 500
+        end
+      end
+    end
+
+    defmodule PromiseCompleter do
+      alias Restate.Context
+
+      def handle(ctx, %{"value" => v}) do
+        Context.complete_promise(ctx, "p", v)
+        :ok
+      end
+    end
+
+    test "get_promise: first run emits GetPromiseCommand + Suspension" do
+      assert [
+               %Pb.GetPromiseCommandMessage{key: "p", result_completion_id: cid},
+               %Pb.SuspensionMessage{waiting_completions: [susp_cid]}
+             ] = run(%Pb.StartMessage{}, nil, {PromiseGetter, :handle, 2})
+
+      assert cid == 1
+      assert susp_cid == 1
+    end
+
+    test "get_promise: replay with Value notification returns the value" do
+      replay = [
+        %Pb.GetPromiseCommandMessage{key: "p", result_completion_id: 1},
+        %Pb.GetPromiseCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:value, %Pb.Value{content: Jason.encode!("Till")}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {PromiseGetter, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == "Till"
+    end
+
+    test "get_promise: replay with Failure notification raises terminal" do
+      replay = [
+        %Pb.GetPromiseCommandMessage{key: "p", result_completion_id: 1},
+        %Pb.GetPromiseCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:failure, %Pb.Failure{code: 409, message: "rejected"}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "rejected"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {PromiseGetter, :handle, 2}, replay)
+    end
+
+    test "peek_promise: Void completion surfaces as :pending — handler raises terminal" do
+      replay = [
+        %Pb.GetPromiseCommandMessage{key: "p", result_completion_id: 1},
+        %Pb.GetPromiseCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:value, %Pb.Value{content: Jason.encode!("Till")}}
+        },
+        %Pb.PeekPromiseCommandMessage{key: "p", result_completion_id: 2},
+        %Pb.PeekPromiseCompletionNotificationMessage{
+          completion_id: 2,
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      # PromiseRoundTrip raises a TerminalError when peek doesn't say :ok.
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 500, message: "promise should be ready"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {PromiseRoundTrip, :handle, 2}, replay)
+    end
+
+    test "peek_promise: Value completion returns {:ok, value}; full round-trip works" do
+      replay = [
+        %Pb.GetPromiseCommandMessage{key: "p", result_completion_id: 1},
+        %Pb.GetPromiseCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:value, %Pb.Value{content: Jason.encode!("Till")}}
+        },
+        %Pb.PeekPromiseCommandMessage{key: "p", result_completion_id: 2},
+        %Pb.PeekPromiseCompletionNotificationMessage{
+          completion_id: 2,
+          result: {:value, %Pb.Value{content: Jason.encode!("Till")}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {PromiseRoundTrip, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == "Till"
+    end
+
+    test "complete_promise: emits CompletePromiseCommand + Suspension" do
+      assert [
+               %Pb.CompletePromiseCommandMessage{
+                 key: "p",
+                 result_completion_id: cid,
+                 completion: {:completion_value, %Pb.Value{content: bytes}}
+               },
+               %Pb.SuspensionMessage{waiting_completions: [susp_cid]}
+             ] = run(%Pb.StartMessage{}, %{"value" => "Till"}, {PromiseCompleter, :handle, 2})
+
+      assert cid == 1
+      assert susp_cid == 1
+      assert Jason.decode!(bytes) == "Till"
+    end
+
+    test "complete_promise: replay with Void ack continues normally" do
+      replay = [
+        %Pb.CompletePromiseCommandMessage{
+          key: "p",
+          result_completion_id: 1,
+          completion: {:completion_value, %Pb.Value{content: ~s("Till")}}
+        },
+        %Pb.CompletePromiseCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(%Pb.StartMessage{}, %{"value" => "Till"}, {PromiseCompleter, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == "ok"
+    end
+
+    test "get_promise: cancel + no completion → raises 409" do
+      replay = [
+        %Pb.GetPromiseCommandMessage{key: "p", result_completion_id: 1},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+               },
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {PromiseGetter, :handle, 2}, replay)
+    end
+  end
 end

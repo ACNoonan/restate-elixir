@@ -338,6 +338,72 @@ defmodule Restate.Context do
   end
 
   @doc """
+  Block on a Workflow durable promise and return its resolved value.
+
+  Promises are scoped to the Workflow's key — the same `name` resolves
+  to the same promise across the workflow handler and its `@Shared`
+  helpers. This call records a `GetPromiseCommand` and suspends until
+  the promise is set (via `complete_promise/3`) or rejected (via
+  `reject_promise/4`).
+
+  Raises `Restate.TerminalError` if the promise was rejected.
+  """
+  @spec get_promise(t(), String.t()) :: term()
+  def get_promise(%__MODULE__{pid: pid}, name) when is_binary(name) do
+    case GenServer.call(pid, {:promise_get, name}, :infinity) do
+      {:ok, value} -> value
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
+  end
+
+  @doc """
+  Non-blocking probe of a Workflow durable promise.
+
+  Returns `:pending` if the promise hasn't been set yet, `{:ok, v}`
+  if resolved with a value, or `{:terminal_error, exc}` if rejected.
+  Useful for "the await is over, verify we got here via the promise
+  rather than a spurious resume" assertions.
+  """
+  @spec peek_promise(t(), String.t()) :: :pending | {:ok, term()} | {:terminal_error, Restate.TerminalError.t()}
+  def peek_promise(%__MODULE__{pid: pid}, name) when is_binary(name) do
+    GenServer.call(pid, {:promise_peek, name}, :infinity)
+  end
+
+  @doc """
+  Resolve a Workflow durable promise with `value`.
+
+  Typically called from a `@Shared` handler so external code can
+  unblock the workflow's `get_promise/2` await. Returns `:ok`; raises
+  `Restate.TerminalError` if the runtime refuses (e.g. the promise
+  was already rejected and a value can't replace it).
+  """
+  @spec complete_promise(t(), String.t(), term()) :: :ok
+  def complete_promise(%__MODULE__{pid: pid}, name, value) when is_binary(name) do
+    case GenServer.call(pid, {:promise_complete, name, {:value, encode_parameter(value)}}, :infinity) do
+      :ok -> :ok
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
+  end
+
+  @doc """
+  Reject a Workflow durable promise with a terminal failure.
+
+  The waiting `get_promise/2` raises `Restate.TerminalError{code, message}`.
+  """
+  @spec reject_promise(t(), String.t(), non_neg_integer(), String.t()) :: :ok
+  def reject_promise(%__MODULE__{pid: pid}, name, code, message)
+      when is_binary(name) and is_integer(code) and is_binary(message) do
+    case GenServer.call(
+           pid,
+           {:promise_complete, name, {:failure, code, message}},
+           :infinity
+         ) do
+      :ok -> :ok
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
+  end
+
+  @doc """
   Cancel another invocation by id.
 
   Emits a `SendSignalCommandMessage` carrying the built-in CANCEL
