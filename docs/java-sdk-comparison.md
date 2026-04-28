@@ -403,10 +403,27 @@ the Java read makes concrete:
   `sleepConcurrently` and Proxy's `manyCalls` were rewritten to use
   `Awaitable.all` directly instead of the previous sequential
   await-loop workarounds.
-- **`ctx.run` retry policies.** Java's `RunState.java` (70 LoC) +
-  `proposeRunCompletion` paths handle exponential backoff,
-  max-attempts, terminal-on-exhaust. Demo 5 (sustained-load soak)
-  exercises this indirectly.
+- **`ctx.run` retry policies.** ✓ Landed (v0.2). Implemented in
+  [`apps/restate_server/lib/restate/retry_policy.ex`](../apps/restate_server/lib/restate/retry_policy.ex)
+  (~50 LoC) + an in-process retry loop in `Restate.Context.run/3`
+  (~30 LoC). Java's reference is `RunState.java` (70 LoC) + the
+  `proposeRunCompletion` paths through `StateMachineImpl`. Same
+  semantics: synchronous in-SDK retry with exponential backoff;
+  on exhaustion, propose a terminal failure (code 500) so future
+  replays return the same error deterministically. Conformance:
+  `RunRetry × 3` + `RunFlush × 1`, all green.
+
+  The conformance suite forced two non-obvious design points:
+  (1) `ctx.run` suspends after `ProposeRunCompletion` (in
+  REQUEST_RESPONSE mode) so the runtime can ack durable storage
+  before the next side-effect — `RunFlush.flush` asserts the
+  final response is 0 across 3 sequential `ctx.run`s, which only
+  works if every prior propose is journaled before its function
+  re-runs;
+  (2) Counter state used by the conformance handlers
+  (`Failing.sideEffectFailsAfterGivenAttempts` etc.) lives in a
+  named ETS table — equivalent to Java's class-level `AtomicInteger`
+  fields, persisting across invocations within the BEAM.
 - **Cancellation signal (`cancelInvocation`).** ✓ Landed (v0.2).
   Built-in CANCEL signal lives at signal_id 1 (per
   `BuiltInSignal.CANCEL` in protocol.proto:670 and Java's

@@ -17,11 +17,23 @@ defmodule Restate.TestServices.Failing do
       handler's response.
     * `failingCallWithEventualSuccess()` — fails with a non-terminal
       exception three times in a row, succeeds on the fourth attempt.
+    * `sideEffectSucceedsAfterGivenAttempts(N)` — `ctx.run` with
+      infinite retry policy. Function increments a class-level
+      counter; throws until count >= 4, then returns the count.
+      Used by `RunRetry.withSuccess`.
+    * `sideEffectFailsAfterGivenAttempts(N)` — `ctx.run` with
+      `max_attempts: N`. Function always throws. After exhaustion
+      the SDK proposes a terminal failure; the handler catches
+      and returns the (post-retry) counter. Used by
+      `RunRetry.executedOnlyOnce` / `RunRetry.withExhaustedAttempts`.
 
-  ### Not yet implemented
+  ## Why ETS for the counters
 
-    * `sideEffectSucceedsAfterGivenAttempts` — needs Run retry policies
-    * `sideEffectFailsAfterGivenAttempts`    — needs Run retry policies
+  Java keeps these as `AtomicInteger` instance fields on a singleton
+  service impl — they persist across invocations within the JVM. Our
+  equivalent is a named ETS table: handler processes come and go
+  per-invocation, but the table outlives them and supports atomic
+  increments via `:ets.update_counter/3`. Same observable behaviour.
   """
 
   @counter_table :restate_test_services_failing_counters
@@ -37,6 +49,8 @@ defmodule Restate.TestServices.Failing do
     end
 
     :ets.insert(@counter_table, {:eventual_success, 0})
+    :ets.insert(@counter_table, {:eventual_success_side_effect, 0})
+    :ets.insert(@counter_table, {:eventual_failure_side_effect, 0})
     :ok
   end
 
@@ -81,6 +95,52 @@ defmodule Restate.TestServices.Failing do
       attempt
     else
       raise "Failed at attempt: #{attempt}"
+    end
+  end
+
+  def side_effect_succeeds_after_given_attempts(%Restate.Context{} = ctx, minimum_attempts)
+      when is_integer(minimum_attempts) do
+    Restate.Context.run(
+      ctx,
+      fn ->
+        attempt = :ets.update_counter(@counter_table, :eventual_success_side_effect, 1)
+
+        if attempt >= 4 do
+          :ets.insert(@counter_table, {:eventual_success_side_effect, 0})
+          attempt
+        else
+          raise "Failed at attempt: #{attempt}"
+        end
+      end,
+      initial_interval_ms: 10,
+      factor: 1.0
+    )
+  end
+
+  def side_effect_fails_after_given_attempts(%Restate.Context{} = ctx, max_retry_count)
+      when is_integer(max_retry_count) do
+    try do
+      Restate.Context.run(
+        ctx,
+        fn ->
+          attempt = :ets.update_counter(@counter_table, :eventual_failure_side_effect, 1)
+          raise "Failed at attempt: #{attempt}"
+        end,
+        max_attempts: max_retry_count,
+        initial_interval_ms: 10,
+        factor: 1.0
+      )
+
+      # Unreachable: the run is always failing.
+      raise Restate.TerminalError,
+        message: "expected the side-effect to fail",
+        code: 500
+    rescue
+      _ in Restate.TerminalError ->
+        # The retry budget was exhausted. Read the post-retry counter
+        # and return it — the test asserts response >= max_retry_count.
+        [{_, count}] = :ets.lookup(@counter_table, :eventual_failure_side_effect)
+        count
     end
   end
 end

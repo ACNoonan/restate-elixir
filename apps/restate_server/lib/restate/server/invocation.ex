@@ -488,16 +488,33 @@ defmodule Restate.Server.Invocation do
     end
   end
 
-  def handle_call({:propose_run, cid, {:value, value}}, _from, state) do
+  # `propose_run_and_suspend` is the run-flush primitive. The SDK
+  # proposes the value/failure and immediately suspends on the run's
+  # `result_completion_id` — Restate stores the proposal as a
+  # `RunCompletionNotification`, then re-invokes us. On the next
+  # invocation the journal contains both the RunCommand and its
+  # completion, so the replay path returns `{:replay_value, _}` and
+  # the handler proceeds to the next op.
+  #
+  # This costs one HTTP round-trip per `ctx.run` in REQUEST_RESPONSE
+  # mode but is what the protocol requires — see `RunFlush` in the
+  # conformance suite, which asserts side effects do NOT execute on
+  # the final invocation (because every prior propose was journaled).
+  def handle_call({:propose_run_and_suspend, cid, {:value, value}}, from, state) do
     propose = %Pb.ProposeRunCompletionMessage{
       result_completion_id: cid,
       result: {:value, encode_run_value(value)}
     }
 
-    {:reply, :ok, %{state | emitted: [propose | state.emitted]}}
+    state = %{state | emitted: [propose | state.emitted]}
+    suspend(state, cid, from)
   end
 
-  def handle_call({:propose_run, cid, {:failure, %Restate.TerminalError{} = exc}}, _from, state) do
+  def handle_call(
+        {:propose_run_and_suspend, cid, {:failure, %Restate.TerminalError{} = exc}},
+        from,
+        state
+      ) do
     metadata =
       Enum.map(exc.metadata || %{}, fn {k, v} ->
         %Pb.FailureMetadata{key: to_string(k), value: to_string(v)}
@@ -509,7 +526,8 @@ defmodule Restate.Server.Invocation do
         {:failure, %Pb.Failure{code: exc.code, message: exc.message || "", metadata: metadata}}
     }
 
-    {:reply, :ok, %{state | emitted: [propose | state.emitted]}}
+    state = %{state | emitted: [propose | state.emitted]}
+    suspend(state, cid, from)
   end
 
   # --- Deferred-emit primitives for awaitable combinators ---
@@ -920,7 +938,12 @@ defmodule Restate.Server.Invocation do
   defp decode_response(""), do: nil
   defp decode_response(bytes) when is_binary(bytes), do: Jason.decode!(bytes)
 
-  defp encode_run_value(bytes) when is_binary(bytes), do: bytes
+  # Always JSON-encode the run's return value so it round-trips
+  # through `decode_response/1` on replay. The `{:raw, bytes}` form
+  # is the explicit opt-out for callers who already hold pre-encoded
+  # wire bytes (mirrors the same pattern in `Restate.Context.encode_parameter/1`
+  # and `Proxy.result_to_binary/1`).
+  defp encode_run_value({:raw, bytes}) when is_binary(bytes), do: bytes
   defp encode_run_value(term), do: Jason.encode!(term)
 
   # Awakeable id encoding for V5 / signal-based awakeables.

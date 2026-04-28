@@ -102,10 +102,23 @@ defmodule Restate.TestServices.Proxy do
   defp result_to_binary(term), do: Jason.encode!(term)
 
   defp opts(%{"virtualObjectKey" => key} = req) when is_binary(key) do
-    [key: key, idempotency_key: Map.get(req, "idempotencyKey")]
+    base = [key: key, idempotency_key: Map.get(req, "idempotencyKey")]
+    add_delay(base, req)
   end
 
   defp opts(req) do
-    [idempotency_key: Map.get(req, "idempotencyKey")]
+    base = [idempotency_key: Map.get(req, "idempotencyKey")]
+    add_delay(base, req)
   end
+
+  # `delayMillis` is relative ms-from-now in the test request, but
+  # `OneWayCallCommandMessage.invoke_time` is absolute UNIX-epoch ms
+  # (per protocol.proto:465). Convert here. The wall-clock read happens
+  # at first-emit and is captured in the journal, so replays use the
+  # frozen absolute time.
+  defp add_delay(opts, %{"delayMillis" => ms}) when is_integer(ms) and ms > 0 do
+    [{:invoke_at_ms, :os.system_time(:millisecond) + ms} | opts]
+  end
+
+  defp add_delay(opts, _), do: opts
 end

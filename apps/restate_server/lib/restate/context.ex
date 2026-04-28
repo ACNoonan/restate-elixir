@@ -399,7 +399,35 @@ defmodule Restate.Context do
       unchanged (use them for opaque blob results).
   """
   @spec run(t(), (-> term())) :: term()
-  def run(%__MODULE__{pid: pid}, fun) when is_function(fun, 0) do
+  def run(%__MODULE__{} = ctx, fun) when is_function(fun, 0), do: run(ctx, fun, [])
+
+  @doc """
+  `run/2` with an explicit retry policy. `opts` is a keyword list
+  that builds a `Restate.RetryPolicy`:
+
+      Restate.Context.run(ctx, &flaky_call/0,
+        max_attempts: 3,
+        initial_interval_ms: 100,
+        factor: 2.0
+      )
+
+  When the function raises a non-terminal exception, the SDK
+  retries it in-process with exponential backoff. Once the budget is
+  exhausted (default: infinite), the SDK proposes a
+  `Restate.TerminalError{code: 500, message: "ctx.run exhausted retries: ..."}`
+  as the run's failure — the next replay sees the terminal failure
+  deterministically.
+
+  `Restate.TerminalError` raised inside the function is *not*
+  retried — it's journaled immediately as the run's failure. Use it
+  for "give up forever" failures (validation, business-logic dead
+  ends).
+  """
+  @spec run(t(), (-> term()), keyword()) :: term()
+  def run(%__MODULE__{pid: pid} = ctx, fun, opts)
+      when is_function(fun, 0) and is_list(opts) do
+    policy = Restate.RetryPolicy.from_opts(opts)
+
     case GenServer.call(pid, :start_run, :infinity) do
       {:replay_value, value} ->
         value
@@ -413,14 +441,44 @@ defmodule Restate.Context do
         raise exc
 
       {:execute, cid} ->
-        try do
-          result = fun.()
-          :ok = GenServer.call(pid, {:propose_run, cid, {:value, result}}, :infinity)
-          result
-        rescue
-          e in Restate.TerminalError ->
-            :ok = GenServer.call(pid, {:propose_run, cid, {:failure, e}}, :infinity)
-            reraise e, __STACKTRACE__
+        do_run_with_retry(ctx, cid, fun, policy, 1)
+    end
+  end
+
+  # Synchronous in-process retry loop. On success, propose value +
+  # suspend (handler process is then killed via the GenServer's
+  # `:stop`, so any code after the propose is unreachable). On
+  # `Restate.TerminalError`, propose the failure + suspend — no
+  # retry. On any other exception, either retry (after backoff) or
+  # exhaust (propose synthesized terminal failure + suspend). The
+  # function value is returned only on the replay path through
+  # `run/3`'s outer `case`; on the first execution this function
+  # never returns.
+  defp do_run_with_retry(%__MODULE__{pid: pid} = ctx, cid, fun, policy, attempt) do
+    try do
+      result = fun.()
+      GenServer.call(pid, {:propose_run_and_suspend, cid, {:value, result}}, :infinity)
+      # Unreachable on first execution (handler killed when GenServer
+      # suspends). The value below is only here for type-completeness;
+      # the *real* return value comes from the replay path.
+      result
+    rescue
+      e in Restate.TerminalError ->
+        GenServer.call(pid, {:propose_run_and_suspend, cid, {:failure, e}}, :infinity)
+        reraise e, __STACKTRACE__
+
+      e ->
+        if Restate.RetryPolicy.exhausted?(policy, attempt) do
+          terminal = %Restate.TerminalError{
+            code: 500,
+            message: "ctx.run exhausted retries: " <> Exception.message(e)
+          }
+
+          GenServer.call(pid, {:propose_run_and_suspend, cid, {:failure, terminal}}, :infinity)
+          reraise terminal, __STACKTRACE__
+        else
+          Process.sleep(Restate.RetryPolicy.delay_ms(policy, attempt))
+          do_run_with_retry(ctx, cid, fun, policy, attempt + 1)
         end
     end
   end

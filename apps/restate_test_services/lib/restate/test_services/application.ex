@@ -135,6 +135,16 @@ defmodule Restate.TestServices.Application do
           name: "failingCallWithEventualSuccess",
           type: :exclusive,
           mfa: {Restate.TestServices.Failing, :failing_call_with_eventual_success, 2}
+        },
+        %{
+          name: "sideEffectSucceedsAfterGivenAttempts",
+          type: :exclusive,
+          mfa: {Restate.TestServices.Failing, :side_effect_succeeds_after_given_attempts, 2}
+        },
+        %{
+          name: "sideEffectFailsAfterGivenAttempts",
+          type: :exclusive,
+          mfa: {Restate.TestServices.Failing, :side_effect_fails_after_given_attempts, 2}
         }
       ]
     })
@@ -210,6 +220,11 @@ defmodule Restate.TestServices.Application do
           name: "cancelInvocation",
           type: nil,
           mfa: {Restate.TestServices.TestUtilsService, :cancel_invocation, 2}
+        },
+        %{
+          name: "countExecutedSideEffects",
+          type: nil,
+          mfa: {Restate.TestServices.TestUtilsService, :count_executed_side_effects, 2}
         }
       ]
     })

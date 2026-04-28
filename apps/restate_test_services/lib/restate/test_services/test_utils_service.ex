@@ -10,16 +10,20 @@ defmodule Restate.TestServices.TestUtilsService do
 
   ### Implemented
 
-    * `echo`             — round-trip a string
-    * `uppercaseEcho`    — round-trip a string, uppercased
-    * `sleepConcurrently` — create N timers and wait on them all
-    * `cancelInvocation` — emit a CANCEL signal at the given invocation id
+    * `echo`                     — round-trip a string
+    * `uppercaseEcho`            — round-trip a string, uppercased
+    * `sleepConcurrently`        — create N timers and wait on them all
+    * `cancelInvocation`         — emit a CANCEL signal at the given invocation id
+    * `countExecutedSideEffects` — call `ctx.run` N times; each run
+      increments an invocation-local `:counters` ref. The conformance
+      `RunFlush` test asserts the final response is 0 — the SDK
+      suspends after each ProposeRunCompletion, so on the final
+      replay none of the runs re-execute and the counter stays at 0.
 
   ### Not yet implemented (omitted from the registration map)
 
-    * `echoHeaders`              — needs request-header plumbing on the Context
-    * `rawEcho`                  — needs raw-bytes I/O (handler currently assumes JSON)
-    * `countExecutedSideEffects` — needs `ctx.run` (Run command pair, post-v0.1)
+    * `echoHeaders` — needs request-header plumbing on the Context
+    * `rawEcho`    — needs raw-bytes I/O (handler currently assumes JSON)
 
   ### sleepConcurrently note
 
@@ -49,5 +53,15 @@ defmodule Restate.TestServices.TestUtilsService do
   def cancel_invocation(%Context{} = ctx, invocation_id) when is_binary(invocation_id) do
     Context.cancel_invocation(ctx, invocation_id)
     nil
+  end
+
+  def count_executed_side_effects(%Context{} = ctx, increments) when is_integer(increments) do
+    counter = :counters.new(1, [])
+
+    Enum.each(1..increments//1, fn _ ->
+      Context.run(ctx, fn -> :counters.add(counter, 1, 1) end)
+    end)
+
+    :counters.get(counter, 1)
   end
 end

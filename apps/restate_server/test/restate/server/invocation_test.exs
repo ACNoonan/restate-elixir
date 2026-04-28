@@ -979,4 +979,136 @@ defmodule Restate.Server.InvocationTest do
       assert Jason.decode!(out) == [1, "ok"]
     end
   end
+
+  describe "ctx.run with retry policy" do
+    defmodule AlwaysSucceeds do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.run(ctx, fn -> "ok" end)
+      end
+    end
+
+    defmodule AlwaysFails do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.run(ctx, fn -> raise "always fails" end,
+          max_attempts: 2,
+          initial_interval_ms: 1,
+          factor: 1.0
+        )
+      end
+    end
+
+    defmodule CatchesExhaustion do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        try do
+          Context.run(ctx, fn -> raise "always fails" end,
+            max_attempts: 1,
+            initial_interval_ms: 1,
+            factor: 1.0
+          )
+        rescue
+          _ in Restate.TerminalError -> "caught"
+        end
+      end
+    end
+
+    test "successful run: emits RunCommand + ProposeRunCompletion(value) + Suspension" do
+      assert [
+               %Pb.RunCommandMessage{result_completion_id: cid},
+               %Pb.ProposeRunCompletionMessage{
+                 result_completion_id: prop_cid,
+                 result: {:value, "\"ok\""}
+               },
+               %Pb.SuspensionMessage{
+                 waiting_completions: [susp_cid],
+                 waiting_signals: [1]
+               }
+             ] = run(%Pb.StartMessage{}, nil, {AlwaysSucceeds, :handle, 2})
+
+      assert cid == prop_cid
+      assert susp_cid == cid
+    end
+
+    test "replay with stored value: returns the journaled value, no re-execute" do
+      replay = [
+        %Pb.RunCommandMessage{result_completion_id: 1},
+        %Pb.RunCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:value, %Pb.Value{content: ~s("ok")}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {AlwaysSucceeds, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == "ok"
+    end
+
+    test "exhausted retry: proposes terminal failure (code 500), suspends" do
+      # max_attempts: 2 → fun runs twice, both fail, SDK proposes a
+      # terminal failure with code 500 carrying the original message.
+      assert [
+               %Pb.RunCommandMessage{result_completion_id: cid},
+               %Pb.ProposeRunCompletionMessage{
+                 result_completion_id: prop_cid,
+                 result: {:failure, %Pb.Failure{code: 500, message: msg}}
+               },
+               %Pb.SuspensionMessage{waiting_completions: [susp_cid]}
+             ] = run(%Pb.StartMessage{}, nil, {AlwaysFails, :handle, 2})
+
+      assert cid == prop_cid
+      assert susp_cid == cid
+      assert msg =~ "exhausted retries"
+      assert msg =~ "always fails"
+    end
+
+    test "replay with stored failure: ctx.run raises, handler can rescue + return" do
+      replay = [
+        %Pb.RunCommandMessage{result_completion_id: 1},
+        %Pb.RunCompletionNotificationMessage{
+          completion_id: 1,
+          result:
+            {:failure, %Pb.Failure{code: 500, message: "ctx.run exhausted retries: boom"}}
+        }
+      ]
+
+      # Handler catches the terminal and returns a value. This is
+      # the pattern Failing.sideEffectFailsAfterGivenAttempts uses to
+      # report the post-retry counter back to the test client.
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {CatchesExhaustion, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == "caught"
+    end
+
+    test "RetryPolicy: exponential backoff capped at max_interval_ms" do
+      p = Restate.RetryPolicy.from_opts(initial_interval_ms: 100, factor: 2.0, max_interval_ms: 500)
+
+      assert Restate.RetryPolicy.delay_ms(p, 1) == 100
+      assert Restate.RetryPolicy.delay_ms(p, 2) == 200
+      assert Restate.RetryPolicy.delay_ms(p, 3) == 400
+      # 4th attempt would be 800 — capped at 500.
+      assert Restate.RetryPolicy.delay_ms(p, 4) == 500
+      assert Restate.RetryPolicy.delay_ms(p, 5) == 500
+    end
+
+    test "RetryPolicy: exhausted? respects max_attempts (nil = infinite)" do
+      assert Restate.RetryPolicy.exhausted?(%Restate.RetryPolicy{max_attempts: nil}, 1_000) ==
+               false
+
+      p = Restate.RetryPolicy.from_opts(max_attempts: 3)
+      refute Restate.RetryPolicy.exhausted?(p, 2)
+      assert Restate.RetryPolicy.exhausted?(p, 3)
+      assert Restate.RetryPolicy.exhausted?(p, 4)
+    end
+  end
 end
