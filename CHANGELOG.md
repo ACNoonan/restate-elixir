@@ -5,7 +5,7 @@ All notable changes to `restate-elixir` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — Unreleased
+## [0.2.0] — 2026-04-28
 
 **Conformance: 49 / 49 across all targeted `sdk-test-suite` v4.1
 classes** in `alwaysSuspending`, `lazyState`, and
