@@ -47,21 +47,45 @@ defmodule Restate.TestServices.Proxy do
   end
 
   @doc """
-  Fan out multiple calls (sequentially in v0.1 — combinator semantics
-  arrive when we add awaitable composition in v0.2). Each request is
-  either a regular call or a one-way send.
+  Fan out multiple calls in parallel using `Restate.Awaitable.all/2`.
 
-  `awaitAtTheEnd` is honoured trivially since we don't have parallel
-  awaitables yet — every call is awaited at its own callsite.
+  For every request flagged `awaitAtTheEnd`, we kick off a deferred
+  `ctx.call_async` and collect the handle; for the rest we issue
+  `ctx.call` / `ctx.send` synchronously at their own callsite. After
+  the loop, `Awaitable.all` waits on the parallel set in one
+  suspension cycle — what was N round-trips before v0.2 collapses to
+  a single batched suspend with `waiting_completions: [...]`.
+
+  One-way calls don't have a result, so they're never collected
+  into the await set regardless of the flag.
   """
   def many_calls(%Context{} = ctx, requests) when is_list(requests) do
-    Enum.each(requests, fn %{"proxyRequest" => req, "oneWayCall" => one_way?} ->
-      if one_way? do
-        one_way_call(ctx, req)
-      else
-        call(ctx, req)
-      end
-    end)
+    handles =
+      Enum.flat_map(requests, fn
+        %{"proxyRequest" => req, "oneWayCall" => true} ->
+          one_way_call(ctx, req)
+          []
+
+        %{"proxyRequest" => req, "oneWayCall" => false, "awaitAtTheEnd" => true} ->
+          [
+            Restate.Context.call_async(
+              ctx,
+              req["serviceName"],
+              req["handlerName"],
+              {:raw, message_to_binary(req)},
+              opts(req)
+            )
+          ]
+
+        %{"proxyRequest" => req, "oneWayCall" => false} ->
+          # `awaitAtTheEnd: false` (or missing) → block at this site.
+          call(ctx, req)
+          []
+      end)
+
+    if handles != [] do
+      Restate.Awaitable.all(ctx, handles)
+    end
 
     nil
   end

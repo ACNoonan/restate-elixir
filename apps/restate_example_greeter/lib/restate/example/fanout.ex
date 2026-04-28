@@ -29,14 +29,27 @@ defmodule Restate.Example.Fanout do
   closure scopes on a single heap; Promise-based fan-out at this
   scale typically OOMs without careful work-batching.
 
-  ## Why fire-and-forget rather than awaitable fan-out
+  ## Fire-and-forget vs awaitable fan-out
 
-  v0.1 doesn't have awaitable combinators (`Awaitable.all` /
-  `Awaitable.any`) — those are v0.2 work. The "fan-out and gather"
-  shape (orchestrator awaits all N children's results) needs them
-  to be efficient. Fire-and-forget skips the await dimension and
-  measures pure throughput, which is what the BEAM concurrency
-  story is about anyway.
+  Two demos sit side-by-side:
+
+    * `Orchestrator.run/2` (fire-and-forget) — N `ctx.send_async`
+      and return. Pure throughput shape; no gather. The number we
+      brag about: 20K in-flight invocations on a single 256 MB pod.
+
+    * `Orchestrator.gather/2` (fan-out + gather) — N awakeables,
+      N children, then `Restate.Awaitable.all/2` over the awakeable
+      handles. Two HTTP round-trips on the orchestrator regardless of
+      N: pass 1 emits N OneWayCalls + a Suspension whose
+      `waiting_signals` lists every child signal id; pass 2 finds
+      every signal already resolved and emits the aggregated Output.
+      Before the v0.2 combinator landed this gather was a literal
+      `Enum.map(handles, &Context.await_awakeable/2)` — same wire
+      shape (since Restate replays through completed signals
+      linearly anyway in REQUEST_RESPONSE mode), but the API now
+      reads as one `Awaitable.all` call instead of a hand-rolled
+      loop. The optimisation moves to v0.3 if/when we lift the
+      streaming-resume restriction.
   """
 
   defmodule Orchestrator do
@@ -90,10 +103,8 @@ defmodule Restate.Example.Fanout do
         })
       end)
 
-      results =
-        Enum.map(awakeables, fn {_task_id, _id, handle} ->
-          Context.await_awakeable(ctx, handle)
-        end)
+      handles = Enum.map(awakeables, fn {_task_id, _id, handle} -> handle end)
+      results = Restate.Awaitable.all(ctx, handles)
 
       %{
         gathered: length(results),

@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: v0.2 cancellation-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **34 / 34 official `sdk-test-suite` conformance tests passing across all targeted classes, including the v0.2 cancellation surface (`KillInvocation`, `Cancellation × 6`).** No Hex release yet.
+> **Status: v0.2 cancellation + awaitable-combinators complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **37 / 37 official `sdk-test-suite` conformance tests passing across all targeted classes, including the v0.2 cancellation surface (`KillInvocation`, `Cancellation × 6`) and awaitable combinators (`Combinators × 3`).** No Hex release yet.
 
 ## Why this exists
 
@@ -118,8 +118,8 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | `docker compose` dev loop against `restate:1.6.2` | ✓ |
 | `kind` cluster test bed with self-contained manifests | ✓ |
 | Cancellation (`cancelInvocation` + built-in CANCEL signal id 1) | ✓ (v0.2) |
+| Awaitable combinators (`Awaitable.any` / `Awaitable.all` / `Awaitable.await`) | ✓ (v0.2) |
 | Run retry policies (max-attempts / backoff) | — v0.2 |
-| Awaitable combinators (`Awaitable.any` / `Awaitable.all`) | — v0.2 |
 | Lazy state (`GetLazyStateCommandMessage`) | — v0.2 |
 | Full HTTP/2 same-stream suspend/resume | — v0.2 |
 | Workflow service type | — v0.2 |
@@ -129,7 +129,7 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 
 Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk-test-suite/releases/tag/v4.1) (the official Restate conformance harness, also used by the Java/TS/Python/Go SDKs in CI).
 
-**v0.2: 34 / 34 across every targeted test class** — all of v0.1's `alwaysSuspending` matrix plus the v0.2 cancellation surface (`KillInvocation` + `Cancellation × {CALL, SLEEP, AWAKEABLE} × {Context, AdminAPI}`).
+**v0.2: 37 / 37 across every targeted test class** — all of v0.1's `alwaysSuspending` matrix plus the v0.2 cancellation surface (`KillInvocation` + `Cancellation × {CALL, SLEEP, AWAKEABLE} × {Context, AdminAPI}`) plus the awaitable combinators (`Combinators × 3`).
 
 | Test class (suite) | Result | Notes |
 |---|---|---|
@@ -155,8 +155,11 @@ Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk
 | `KillInvocation.kill` (default) | ✅ **v0.2** | admin-API kill cascades through `ctx.call` chain; lock released |
 | `Cancellation.cancelFromContext` × `{CALL, SLEEP, AWAKEABLE}` | ✅ **v0.2** | SDK-side `ctx.cancel_invocation` interrupts each blocking-op shape |
 | `Cancellation.cancelFromAdminAPI` × `{CALL, SLEEP, AWAKEABLE}` | ✅ **v0.2** | admin-API cancel interrupts each blocking-op shape |
+| `Combinators.awakeableOrTimeoutUsingAwaitAny` | ✅ **v0.2** | `Awaitable.any` over awakeable + timer; suspension lists union of waiting completions/signals |
+| `Combinators.awakeableOrTimeoutUsingAwakeableTimeoutCommand` | ✅ **v0.2** | high-level "await with timeout" via `Awaitable.any` + raise on timer index |
+| `Combinators.firstSuccessfulCompletedAwakeable` | ✅ **v0.2** | `awaitAnySuccessful` loop — drops failed handles, retries until one succeeds |
 
-**34 / 34 across all targeted test classes.** The cancellation cascade (next blocking op of the runner *and* its in-flight callees) is exercised end-to-end — Restate's runtime does not auto-propagate cancel through the call tree, so the SDK emits an explicit `SendSignalCommand{idx: 1}` to outstanding callees alongside its own terminal output.
+**37 / 37 across all targeted test classes.** The cancellation cascade (next blocking op of the runner *and* its in-flight callees) is exercised end-to-end — Restate's runtime does not auto-propagate cancel through the call tree, so the SDK emits an explicit `SendSignalCommand{idx: 1}` to outstanding callees alongside its own terminal output.
 
 The four cells of the durability matrix are all green:
 

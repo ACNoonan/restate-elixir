@@ -383,12 +383,26 @@ adds this section).
 Beyond what PLAN.md already lists, these are additional v0.2 items
 the Java read makes concrete:
 
-- **Awaitable combinators** (`Awaitable.any`, `Awaitable.all`).
-  Implementation in Java spans `AsyncResults.java` (353 LoC) +
-  parts of `AsyncResultsState.java`. In Elixir this maps naturally
-  onto a `Task.async_stream`-style API; Demo 4
-  ([PLAN.md](../PLAN.md#demos-beyond-the-mvp--making-the-beam-case))
-  depends on it.
+- **Awaitable combinators** (`Awaitable.any`, `Awaitable.all`,
+  `Awaitable.await`). ✓ Landed (v0.2). Implemented in
+  [`apps/restate_server/lib/restate/awaitable.ex`](../apps/restate_server/lib/restate/awaitable.ex)
+  (~110 LoC) plus a multi-handle suspend in
+  [`Restate.Server.Invocation`](../apps/restate_server/lib/restate/server/invocation.ex)
+  (`do_await_handles` / `dispatch_handles` / `suspend_for_handles`,
+  ~90 LoC of combinator logic). Java's equivalent is `AsyncResults.java`
+  (353 LoC) + parts of `AsyncResultsState.java` — the size delta is
+  again about idiom fit (a tagged-tuple handle with pattern-matched
+  lookup, vs Java's class hierarchy of DurableFuture<T>). The
+  combinator suspension lists the union of `waiting_completions` +
+  `waiting_signals` (always plus signal_id 1 for cancel), so a
+  multi-handle await is one journal write + one re-invocation
+  regardless of how many of the underlying ops fire concurrently
+  on the runtime side. Conformance: 3 `Combinators` test cases
+  (await-any, awaitable-or-timeout-via-any, await-any-successful),
+  all green. Demo 4's `gather` and TestUtilsService's
+  `sleepConcurrently` and Proxy's `manyCalls` were rewritten to use
+  `Awaitable.all` directly instead of the previous sequential
+  await-loop workarounds.
 - **`ctx.run` retry policies.** Java's `RunState.java` (70 LoC) +
   `proposeRunCompletion` paths handle exponential backoff,
   max-attempts, terminal-on-exhaust. Demo 5 (sustained-load soak)

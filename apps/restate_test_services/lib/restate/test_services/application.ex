@@ -160,6 +160,38 @@ defmodule Restate.TestServices.Application do
     })
 
     Restate.Server.Registry.register_service(%{
+      name: "VirtualObjectCommandInterpreter",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "interpretCommands",
+          type: :exclusive,
+          mfa: {Restate.TestServices.CommandInterpreter, :interpret_commands, 2}
+        },
+        %{
+          name: "resolveAwakeable",
+          type: :shared,
+          mfa: {Restate.TestServices.CommandInterpreter, :resolve_awakeable, 2}
+        },
+        %{
+          name: "rejectAwakeable",
+          type: :shared,
+          mfa: {Restate.TestServices.CommandInterpreter, :reject_awakeable, 2}
+        },
+        %{
+          name: "hasAwakeable",
+          type: :shared,
+          mfa: {Restate.TestServices.CommandInterpreter, :has_awakeable, 2}
+        },
+        %{
+          name: "getResults",
+          type: :shared,
+          mfa: {Restate.TestServices.CommandInterpreter, :get_results, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
       name: "TestUtilsService",
       type: :service,
       handlers: [

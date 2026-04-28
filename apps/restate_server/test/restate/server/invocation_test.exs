@@ -766,4 +766,217 @@ defmodule Restate.Server.InvocationTest do
                run(%Pb.StartMessage{}, nil, {Canceller, :handle, 2}, replay)
     end
   end
+
+  describe "Awaitable combinators (Awaitable.any / .all / .await)" do
+    alias Restate.Awaitable
+
+    defmodule AnyTimerOrAwakeable do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        timer = Context.timer(ctx, 100)
+        {_id, awakeable} = Context.awakeable(ctx)
+        # `any/2` returns `{index, value}` — JSON-encode as a list so
+        # the test can match on it through Jason.
+        {idx, value} = Awaitable.any(ctx, [awakeable, timer])
+        [idx, value]
+      end
+    end
+
+    defmodule AllTimers do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        t1 = Context.timer(ctx, 50)
+        t2 = Context.timer(ctx, 100)
+        Awaitable.all(ctx, [t1, t2])
+      end
+    end
+
+    defmodule AwaitOneTimer do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        t = Context.timer(ctx, 100)
+        Awaitable.await(ctx, t)
+      end
+    end
+
+    test "Awaitable.any: emits Suspension with union of completion + signal ids on first run" do
+      assert [
+               %Pb.SleepCommandMessage{result_completion_id: timer_cid},
+               %Pb.SuspensionMessage{
+                 waiting_completions: comps,
+                 waiting_signals: sigs
+               }
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<1, 2, 3>>},
+                 nil,
+                 {AnyTimerOrAwakeable, :handle, 2}
+               )
+
+      assert timer_cid == 1
+      # awakeable allocates signal_id 17. Suspension lists timer's cid
+      # AND signal 17 AND cancel-signal 1.
+      assert comps == [timer_cid]
+      assert 17 in sigs
+      # Cancel signal id 1 always present.
+      assert 1 in sigs
+    end
+
+    test "Awaitable.any: returns {0, value} when first handle (awakeable) is in journal" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 17},
+          result: {:value, %Pb.Value{content: Jason.encode!("hello")}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<1, 2, 3>>},
+                 nil,
+                 {AnyTimerOrAwakeable, :handle, 2},
+                 replay
+               )
+
+      # Awakeable is index 0 in the input list, value is "hello".
+      assert Jason.decode!(out) == [0, "hello"]
+    end
+
+    test "Awaitable.any: returns {1, :ok} when timer (index 1) fires first" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}}
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<1, 2, 3>>},
+                 nil,
+                 {AnyTimerOrAwakeable, :handle, 2},
+                 replay
+               )
+
+      # Timer is index 1, sleep returns "ok" (atom serializes to that string).
+      assert Jason.decode!(out) == [1, "ok"]
+    end
+
+    test "Awaitable.all: emits two SleepCommands then suspends on both completion ids" do
+      assert [
+               %Pb.SleepCommandMessage{result_completion_id: cid1},
+               %Pb.SleepCommandMessage{result_completion_id: cid2},
+               %Pb.SuspensionMessage{
+                 waiting_completions: comps,
+                 waiting_signals: sigs
+               }
+             ] = run(%Pb.StartMessage{}, nil, {AllTimers, :handle, 2})
+
+      assert cid1 == 1
+      assert cid2 == 2
+      assert Enum.sort(comps) == [1, 2]
+      assert sigs == [1]
+    end
+
+    test "Awaitable.all: returns list of values when all completions are in the journal" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCommandMessage{result_completion_id: 2, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 2, void: %Pb.Void{}}
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {AllTimers, :handle, 2}, replay)
+
+      # Two timers — sleep returns :ok (encodes as "ok").
+      assert Jason.decode!(out) == ["ok", "ok"]
+    end
+
+    test "Awaitable.all: only one completion present → suspends on the missing one" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCommandMessage{result_completion_id: 2, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}}
+      ]
+
+      assert [
+               %Pb.SuspensionMessage{
+                 waiting_completions: [2],
+                 waiting_signals: [1]
+               }
+             ] = run(%Pb.StartMessage{}, nil, {AllTimers, :handle, 2}, replay)
+    end
+
+    test "Awaitable.await: single-handle equivalent of all([h]), unwraps the list" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}}
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {AwaitOneTimer, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == "ok"
+    end
+
+    test "Awaitable.any: cancel during all-pending raises 409" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+               },
+               %Pb.EndMessage{}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<1, 2, 3>>},
+                 nil,
+                 {AnyTimerOrAwakeable, :handle, 2},
+                 replay
+               )
+    end
+
+    test "Awaitable.any: completion present + cancel → returns the completion (cancel parks)" do
+      replay = [
+        %Pb.SleepCommandMessage{result_completion_id: 1, wake_up_time: 0},
+        %Pb.SleepCompletionNotificationMessage{completion_id: 1, void: %Pb.Void{}},
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(
+                 %Pb.StartMessage{id: <<1, 2, 3>>},
+                 nil,
+                 {AnyTimerOrAwakeable, :handle, 2},
+                 replay
+               )
+
+      assert Jason.decode!(out) == [1, "ok"]
+    end
+  end
 end

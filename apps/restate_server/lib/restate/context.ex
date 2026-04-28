@@ -94,6 +94,23 @@ defmodule Restate.Context do
   end
 
   @doc """
+  Deferred-emit variant of `sleep/2`. Records a `SleepCommand` on the
+  journal and returns a handle, **without blocking**. Compose with
+  `Restate.Awaitable.any/2` / `all/2` to wait on a sleep alongside
+  other awaitables — the basis for "await-or-timeout" patterns.
+
+      timer = Restate.Context.timer(ctx, 1_000)
+      {id, awakeable} = Restate.Context.awakeable(ctx)
+      Restate.Awaitable.any(ctx, [awakeable, timer])
+      # → either the awakeable's value or :ok (timer fired first)
+  """
+  @spec timer(t(), non_neg_integer()) :: {:timer_handle, non_neg_integer()}
+  def timer(%__MODULE__{pid: pid}, duration_ms)
+      when is_integer(duration_ms) and duration_ms >= 0 do
+    GenServer.call(pid, {:start_timer, duration_ms}, :infinity)
+  end
+
+  @doc """
   Synchronous request/reply call to another Restate handler. Durable —
   the journal records the call; on replay the recorded result is
   returned without re-invoking the target.
@@ -138,6 +155,34 @@ defmodule Restate.Context do
       {:ok, value} -> value
       {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
     end
+  end
+
+  @doc """
+  Deferred-emit variant of `call/5`. Records a `CallCommand` on the
+  journal and returns a handle, **without blocking**. Compose with
+  `Restate.Awaitable.any/2` / `all/2` to wait on multiple calls in
+  parallel:
+
+      h1 = Restate.Context.call_async(ctx, "Counter", "add", 1, key: "k1")
+      h2 = Restate.Context.call_async(ctx, "Counter", "add", 2, key: "k2")
+      [r1, r2] = Restate.Awaitable.all(ctx, [h1, h2])
+  """
+  @spec call_async(t(), String.t(), String.t(), term(), keyword()) ::
+          {:call_handle, non_neg_integer(), non_neg_integer()}
+  def call_async(%__MODULE__{pid: pid}, service, handler, parameter, opts \\ [])
+      when is_binary(service) and is_binary(handler) do
+    GenServer.call(
+      pid,
+      {:start_call,
+       %{
+         service: service,
+         handler: handler,
+         parameter: encode_parameter(parameter),
+         key: Keyword.get(opts, :key, ""),
+         idempotency_key: Keyword.get(opts, :idempotency_key)
+       }},
+      :infinity
+    )
   end
 
   @doc """

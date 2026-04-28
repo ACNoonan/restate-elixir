@@ -512,6 +512,84 @@ defmodule Restate.Server.Invocation do
     {:reply, :ok, %{state | emitted: [propose | state.emitted]}}
   end
 
+  # --- Deferred-emit primitives for awaitable combinators ---
+  #
+  # `start_timer` and `start_call` emit the journal entry without
+  # blocking. They return a handle (just the completion ids) which the
+  # caller can later pass to `Restate.Awaitable.await/any/all`. The
+  # existing :sleep / :call / :send handlers stay as the
+  # blocking-convenience path used by `Context.sleep` etc.
+
+  def handle_call({:start_timer, duration_ms}, from, state) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.SleepCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          {:reply, {:timer_handle, recorded.result_completion_id}, state}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+
+        cmd = %Pb.SleepCommandMessage{
+          wake_up_time: :os.system_time(:millisecond) + duration_ms,
+          result_completion_id: cid
+        }
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        {:reply, {:timer_handle, cid}, state}
+    end
+  end
+
+  def handle_call({:start_call, target}, from, state) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <- pop_recorded(state.recorded_commands, Pb.CallCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+
+          {:reply,
+           {:call_handle, recorded.result_completion_id, recorded.invocation_id_notification_idx},
+           state}
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid_invok = state.next_completion_id
+        cid_result = cid_invok + 1
+
+        cmd = %Pb.CallCommandMessage{
+          service_name: target.service,
+          handler_name: target.handler,
+          parameter: target.parameter,
+          key: target.key || "",
+          idempotency_key: target.idempotency_key,
+          invocation_id_notification_idx: cid_invok,
+          result_completion_id: cid_result
+        }
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid_result + 1)
+          |> track_command(cmd)
+
+        {:reply, {:call_handle, cid_result, cid_invok}, state}
+    end
+  end
+
+  def handle_call({:await_handles, mode, handles}, from, state)
+      when mode in [:one, :any, :all] and is_list(handles) do
+    do_await_handles(state, mode, handles, from)
+  end
+
   def handle_call({:sleep, duration_ms}, from, state) do
     case state.phase do
       :replaying ->
@@ -883,6 +961,168 @@ defmodule Restate.Server.Invocation do
       awakeable_id: awakeable_id,
       result: {:failure, %Pb.Failure{code: code, message: message}}
     }
+  end
+
+  # --- Combinator (Awaitable.any / .all / await) implementation ---
+
+  # Resolve a single handle against the current state. Returns
+  # `:pending` if its completion isn't in the journal yet. Used by both
+  # the single-handle await and the combinators.
+  defp lookup_handle(state, {:timer_handle, cid}) do
+    case Map.fetch(state.notifications, cid) do
+      :error -> :pending
+      # Sleep completion is :void (no payload) — sleep itself returns :ok.
+      {:ok, _} -> {:ok, :ok}
+    end
+  end
+
+  defp lookup_handle(state, {:call_handle, result_cid, _invok_cid}) do
+    case Map.fetch(state.notifications, result_cid) do
+      :error ->
+        :pending
+
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        {:ok, decode_response(bytes)}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        {:terminal_error,
+         %Restate.TerminalError{
+           code: code,
+           message: message,
+           metadata: decode_failure_metadata(meta)
+         }}
+    end
+  end
+
+  defp lookup_handle(state, {:awakeable_handle, signal_id}) do
+    case Map.fetch(state.signal_notifications, signal_id) do
+      :error ->
+        :pending
+
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        {:ok, decode_response(bytes)}
+
+      {:ok, {:failure, %Pb.Failure{code: code, message: message, metadata: meta}}} ->
+        {:terminal_error,
+         %Restate.TerminalError{
+           code: code,
+           message: message,
+           metadata: decode_failure_metadata(meta)
+         }}
+
+      {:ok, _} ->
+        # Void / other shapes — completed without payload.
+        {:ok, nil}
+    end
+  end
+
+  # Synthetic handle for already-resolved values (e.g. a Run that
+  # threw inline before being composed). Lets handler code uniformly
+  # treat sync-resolved and journal-completable items in
+  # Awaitable.any/all.
+  defp lookup_handle(_state, {:resolved, {:ok, value}}), do: {:ok, value}
+  defp lookup_handle(_state, {:resolved, {:terminal_error, %Restate.TerminalError{} = exc}}),
+    do: {:terminal_error, exc}
+
+  # Reply-shape: list of `{:ok, value}` / `{:terminal_error, exc}` /
+  # `:pending` per handle.
+  defp do_await_handles(state, mode, handles, from) do
+    results = Enum.map(handles, &lookup_handle(state, &1))
+
+    case dispatch_handles(mode, handles, results, state) do
+      {:ready, reply} ->
+        {:reply, reply, state}
+
+      {:suspend_or_cancel, missing_handles} ->
+        if state.cancelled? do
+          state = propagate_cancel_to_outstanding(state, missing_handles)
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend_for_handles(state, missing_handles, from)
+        end
+    end
+  end
+
+  # Decide how to reply based on combinator mode and current per-handle
+  # results. Returns either {:ready, reply} (all info available) or
+  # {:suspend_or_cancel, [missing_handles]}.
+  defp dispatch_handles(:one, [handle], [:pending], _state),
+    do: {:suspend_or_cancel, [handle]}
+
+  defp dispatch_handles(:one, _handles, [{:ok, value}], _state),
+    do: {:ready, {:ok, value}}
+
+  defp dispatch_handles(:one, _handles, [{:terminal_error, exc}], _state),
+    do: {:ready, {:terminal_error, exc}}
+
+  defp dispatch_handles(:any, handles, results, _state) do
+    case Enum.find_index(results, fn r -> r != :pending end) do
+      nil ->
+        {:suspend_or_cancel, handles}
+
+      idx ->
+        case Enum.at(results, idx) do
+          {:ok, value} -> {:ready, {:ok, {:any, idx, value}}}
+          {:terminal_error, exc} -> {:ready, {:any_terminal_error, idx, exc}}
+        end
+    end
+  end
+
+  defp dispatch_handles(:all, handles, results, _state) do
+    case Enum.find_index(results, fn r -> match?({:terminal_error, _}, r) end) do
+      idx when is_integer(idx) ->
+        # First failure short-circuits — match Java's Promise.all semantics.
+        {:terminal_error, exc} = Enum.at(results, idx)
+        {:ready, {:terminal_error, exc}}
+
+      nil ->
+        case Enum.find_index(results, fn r -> r == :pending end) do
+          nil ->
+            values = Enum.map(results, fn {:ok, v} -> v end)
+            {:ready, {:ok, values}}
+
+          _ ->
+            missing =
+              handles
+              |> Enum.zip(results)
+              |> Enum.filter(fn {_, r} -> r == :pending end)
+              |> Enum.map(fn {h, _} -> h end)
+
+            {:suspend_or_cancel, missing}
+        end
+    end
+  end
+
+  # Suspend on the union of completion ids and signal ids for the
+  # missing handles, plus signal_id 1 (CANCEL) so cancel always wins.
+  defp suspend_for_handles(state, handles, _from) do
+    {completions, signals} =
+      Enum.reduce(handles, {[], [@cancel_signal_id]}, fn
+        {:timer_handle, cid}, {comps, sigs} -> {[cid | comps], sigs}
+        {:call_handle, result_cid, _invok_cid}, {comps, sigs} -> {[result_cid | comps], sigs}
+        {:awakeable_handle, sid}, {comps, sigs} -> {comps, [sid | sigs]}
+        {:resolved, _}, acc -> acc
+      end)
+
+    suspension = %Pb.SuspensionMessage{
+      waiting_completions: completions |> Enum.uniq() |> Enum.sort(),
+      waiting_signals: signals |> Enum.uniq() |> Enum.sort()
+    }
+
+    body = encode_response(state.emitted, [suspension])
+    finalize(body, state)
+  end
+
+  # Propagate cancel to any in-flight call handles. Sleep + awakeable +
+  # resolved have nothing to propagate to.
+  defp propagate_cancel_to_outstanding(state, handles) do
+    Enum.reduce(handles, state, fn
+      {:call_handle, _result_cid, invok_cid}, st ->
+        propagate_cancel_to_callee(st, invok_cid)
+
+      _, st ->
+        st
+    end)
   end
 
   # Like suspend/3 but uses waiting_signals instead of waiting_completions.

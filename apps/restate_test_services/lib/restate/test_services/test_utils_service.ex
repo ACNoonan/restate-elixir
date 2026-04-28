@@ -23,13 +23,11 @@ defmodule Restate.TestServices.TestUtilsService do
 
   ### sleepConcurrently note
 
-  The Java reference creates all N timers concurrently and `awaitAll`s
-  them. Our SDK's `Restate.Context.sleep/2` is sequential — there's no
-  promise-style awaitable combinator yet (planned for v0.2). The
-  observable difference is journal shape: Java emits N
-  SleepCommandMessages then one Suspension; we emit one Sleep +
-  Suspension, resume, repeat. Both are protocol-valid; the timing
-  assertions in `Sleep.kt` (`elapsed >= duration`) hold for either.
+  Mirrors the Java reference: emit N `SleepCommand`s up front via
+  `Context.timer/2`, then `Restate.Awaitable.all/2` over the handles.
+  Single suspension whose `waiting_completions` lists every timer id;
+  the runtime fires them in parallel and re-invokes us once with all
+  the completion notifications in the journal.
   """
 
   alias Restate.Context
@@ -39,10 +37,12 @@ defmodule Restate.TestServices.TestUtilsService do
   def uppercase_echo(_ctx, input) when is_binary(input), do: String.upcase(input)
 
   def sleep_concurrently(%Context{} = ctx, durations_ms) when is_list(durations_ms) do
-    Enum.each(durations_ms, fn ms when is_integer(ms) and ms >= 0 ->
-      Context.sleep(ctx, ms)
-    end)
+    handles =
+      Enum.map(durations_ms, fn ms when is_integer(ms) and ms >= 0 ->
+        Context.timer(ctx, ms)
+      end)
 
+    Restate.Awaitable.all(ctx, handles)
     nil
   end
 
