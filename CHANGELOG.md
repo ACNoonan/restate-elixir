@@ -99,5 +99,5 @@ Initial release. Greenfield project.
   classes (State, Sleep, SleepWithFailures, KillRuntime, StopRuntime,
   UserErrors).
 
-[0.2.0]: https://github.com/adamnoonan/restate-elixir/releases/tag/v0.2.0
-[0.1.0]: https://github.com/adamnoonan/restate-elixir/releases/tag/v0.1.0
+[0.2.0]: https://github.com/ACNoonan/restate-elixir/releases/tag/v0.2.0
+[0.1.0]: https://github.com/ACNoonan/restate-elixir/releases/tag/v0.1.0

@@ -1,6 +1,8 @@
 # Plan — restate-elixir MVP
 
-Week-by-week engineering plan for the initial 4-week MVP. Scope deliberately narrow. This document is the canonical engineering plan; deeper strategic context lives in the project's Obsidian vault notes.
+Initial MVP scope, kept deliberately narrow.
+
+> **Status update (v0.2.0).** This document is the original v0.1 plan, preserved for the warm-intro conversation as historical context. v0.2 shipped beyond the MVP scope below — Workflow service type, lazy state, the `oneWayCallWithDelay` proxy fix, awaitable combinators, `ctx.run` retry policies + flush, cancellation surface, and Demos 2-5 all landed. **49 / 49 conformance tests pass.** Open carryovers are HTTP/2 same-stream streaming (v0.3), V6 protocol, Lambda transport, and deeper production hardening. See [README.md](./README.md) for the current implementation matrix.
 
 ## MVP scope
 
@@ -15,13 +17,13 @@ Week-by-week engineering plan for the initial 4-week MVP. Scope deliberately nar
 - Conformance: a subset of scenarios from [restatedev/sdk-test-suite](https://github.com/restatedev/sdk-test-suite)
 - Local `kind` cluster as the durability test bed
 
-### Out (deferred to v0.2+)
+### Out (originally deferred to v0.2+)
 
-- **Workflow** service type — lifecycle and versioning complexity make this the biggest scope-risk; worth shipping a clean service-handler SDK first
-- Lambda transport
-- V6 protocol (superset of V5; advertise V5 only for now)
-- Lazy state (`GetLazyStateCommandMessage` + completion notification round-trip) — eager covers the counter demo; lazy is needed for state larger than the eager bundle threshold
-- Production hardening (observability, backpressure tuning, graceful shutdown edge cases)
+- **Workflow** service type ✓ **shipped in v0.2** — `WorkflowAPI.setAndResolve` conformance test green, durable promises (`get_promise` / `peek_promise` / `complete_promise` / `reject_promise`) wired
+- Lazy state ✓ **shipped in v0.2** — `GetLazyStateCommandMessage` + `GetLazyStateKeysCommandMessage`, honors `StartMessage.partial_state`; `State × 3` × `lazyState` + `lazyStateAlwaysSuspending` matrices both green
+- Lambda transport — still deferred
+- V6 protocol (superset of V5; advertise V5 only for now) — still deferred
+- Production hardening (observability, backpressure tuning, graceful shutdown edge cases) — partial: `DrainCoordinator` + SIGTERM trap shipped (Demo 3); deeper observability + backpressure tuning still ahead
 
 ## Positioning
 
@@ -122,7 +124,7 @@ Plan: reach out after Week 4 with working code and a recorded demo. Frame should
 
 Week 3's pod-kill demo is the table-stakes asset: it proves the V5 protocol works under failure in Elixir. Every Restate SDK survives the same scenario; the demo doesn't differentiate Elixir specifically.
 
-The demos below extend that baseline to surface BEAM-specific operational properties — preemptive scheduling, per-process isolation, cheap concurrency, generational GC — by mapping each to a K8s pain point an SRE has already been bitten by. None are MVP scope; all are v0.2+ roadmap. Their job is to give the upstream-absorption pitch reasons beyond polyglot enablement.
+The demos below extend that baseline to surface BEAM-specific operational properties — preemptive scheduling, per-process isolation, cheap concurrency, generational GC — by mapping each to a K8s pain point an SRE has already been bitten by. None were MVP scope; all shipped in v0.2 (writeups in `docs/demo-2…5-*.md`). Their job is to give the upstream-absorption pitch reasons beyond polyglot enablement.
 
 Each entry follows: **Real-world pain** (the operational story) → **The demo** (what to build, what to measure) → **Why BEAM specifically** (the technical claim, with comparisons) → **Cost / dependencies**.
 
@@ -130,7 +132,10 @@ Each entry follows: **Real-world pain** (the operational story) → **The demo**
 
 The current demo. Invoke `Greeter/world/long_greet`, `kubectl delete pod --force` mid-sleep, runtime re-invokes the new pod, journal replays past the completed sleep, returns `"hello world"`. Proves protocol conformance under failure. No BEAM-specific story — every SDK does this.
 
-### Demo 2 — Noisy-neighbor isolation
+### Demo 2 — Noisy-neighbor isolation ✓ (v0.2)
+
+> Shipped — see [docs/demo-2-noisy-neighbor.md](./docs/demo-2-noisy-neighbor.md). **Measured: P99 of the light cohort inflates to 1.53× under 10 saturating-CPU poisoned handlers; P50 stays at 0.99×.** The original plan is preserved below for context.
+
 
 **Real-world pain.** "One pathological request took down our handler pod." On Node.js this shape of incident is regex backtracking, JSON-parse on a 100MB blob, an unbounded loop someone shipped on a Friday. The single-threaded event loop blocks; every other in-flight invocation stalls. P99 latency for unrelated traffic spikes for the duration of the bad request. Every SRE running Node in production has worn this pager.
 
@@ -145,7 +150,10 @@ Workload: 1,000 concurrent `light` invocations + 5 `poisoned` invocations interl
 
 **Cost / dependencies.** Medium. Needs the poisoned handler variant, a load generator (`hey` or a small Elixir script), Prometheus + Grafana for the plot. Comparison TS handler is optional but doubles the visual impact. No SDK changes — works on top of v0.1.
 
-### Demo 3 — Graceful node drain
+### Demo 3 — Graceful node drain ✓ (v0.2)
+
+> Shipped — see [docs/demo-3-graceful-drain.md](./docs/demo-3-graceful-drain.md). **Measured: 20/20 in-flight `slow_op` invocations completed during a mid-flight drain inside the 3 s budget, no retries.** `Restate.Server.DrainCoordinator` + SIGTERM trap landed (~150 LoC). The original plan is preserved below for context.
+
 
 **Real-world pain.** Every K8s upgrade. `kubectl drain` sends SIGTERM with `terminationGracePeriodSeconds` (default 30s). In-flight requests either finish-or-get-killed at grace expiry, or they hold up the drain past the SLO. Most SDKs don't gracefully suspend pending invocations on shutdown — they treat SIGTERM as "wrap up what you can, drop the rest." Restate's runtime can recover dropped work via re-invocation, but you take a latency hit while the stranded journal entries time out.
 
@@ -165,7 +173,10 @@ Asset: a side-by-side timeline showing TS pod drain (X% of in-flight requests ti
 
 This is the most *visibly* BEAM-flavored demo and worth investing in early in v0.2.
 
-### Demo 4 — High-concurrency fan-out
+### Demo 4 — High-concurrency fan-out ✓ (v0.2)
+
+> Shipped — see [docs/demo-4-fan-out.md](./docs/demo-4-fan-out.md). **Measured: 20,000 in-flight Restate invocations on a single elixir-handler pod, +1 MB peak memory over baseline, 2,489 leaves/sec sustained.** Awakeable-based gather: 1,000 children + aggregation in 1.86 s. The original plan is preserved below for context.
+
 
 **Real-world pain.** "Our enrichment workflow hits 50 downstream services per request and we can't run more than ~200 concurrent without the pod OOMing." This is the canonical Node.js memory story — 1,000 in-flight Promises, each retaining a closure scope, balloons heap into the GB range. Java with `CompletableFuture` is similar; Python `asyncio` better but still dwarfs BEAM.
 
@@ -177,7 +188,10 @@ For comparison, the same pattern on TS on the same pod size — expect either OO
 
 **Cost / dependencies.** Low-to-medium implementation cost — the handler is a few dozen lines. **Hard dependency on `ctx.call` support**, which is post-v0.1 (out-of-scope per the MVP scope). Don't ship Demo 4 until the SDK has `CallCommandMessage` + `CallCompletionNotificationMessage` wired up. v0.2 candidate.
 
-### Demo 5 — Sustained-load soak
+### Demo 5 — Sustained-load soak ✓ (v0.2 baseline)
+
+> Proof-of-concept baseline shipped — see [docs/demo-5-sustained-load.md](./docs/demo-5-sustained-load.md). **Measured: 2,396 `count` + 600 `long_greet` (10 s) at 50 RPS for 60 s; P50 in a 1.4 ms window, P99 drift 0.73×, peak memory delta +1 MB.** Script parameterises to the full 500 RPS × 24 h soak — that run is still ahead. The original plan is preserved below for context.
+
 
 **Real-world pain.** "Latency was fine for the first hour, then degraded." Java/HotSpot G1 GC pauses widen under sustained allocation churn. V8 in Node has heap-fragmentation behavior under steady load. Ops teams budget for restarts every N hours as a workaround — which means the workflow runtime is restart-tolerant by necessity, not by design.
 
@@ -198,11 +212,11 @@ The Week 4 outreach should lead with:
 
 Demos 3–5 become the README's "why Elixir specifically" section and the v0.2 commitments. They're load-bearing for the upstream-absorption pitch — Stephan needs reasons to maintain another SDK beyond polyglot enablement, and "BEAM is operationally well-suited to Restate's workload shape, here are four scenarios with numbers" is a defensible one.
 
-Sequencing for v0.2: ship Demo 2 (cheapest BEAM-differentiated asset) → Demo 3 (most visibly BEAM-flavored, requires SDK drain plumbing that's worth shipping anyway) → Demo 4 (waits on `ctx.call`) → Demo 5 (waits on sustained-load infrastructure).
+Sequencing for v0.2 (executed in this order): Demo 2 → Demo 3 → Demo 4 → Demo 5. All four shipped; full 500 RPS × 24 h soak run for Demo 5 is still ahead but the methodology and 60 s baseline are in place.
 
 ## Known risks
 
-1. **Bandit HTTP/2 full-duplex streaming** is the single biggest unknown. Plug's model is request-then-response; Restate assumes interleaved frames on one stream. Fallback: **request/response mode** — works for the Week 3 demo (sleep suspension + re-invocation); loses the same-stream suspend/resume optimization. **Don't spend >3 days fighting Bandit before considering the fallback.** Week 1 manifest already advertises `REQUEST_RESPONSE`, so the fallback is the default unless a deliberate upgrade happens later.
+1. **Bandit HTTP/2 full-duplex streaming** was the single biggest unknown. Plug's model is request-then-response; Restate assumes interleaved frames on one stream. Outcome: the **REQUEST_RESPONSE fallback** was taken and shipped — the discovery manifest advertises it, every conformance scenario passes against it, and it costs one extra round-trip per suspension vs same-stream resume. Same-stream HTTP/2 streaming remains the v0.3 carryover; the SDK is structured so it's an incremental change in `Restate.Server.Endpoint`, not a rewrite.
 2. **V5 Command/Notification correlation.** V5 splits each suspending operation into a `*CommandMessage` (with a `completion_id`) and a `*CompletionNotificationMessage` (carrying the same id). The state machine must thread completion-ids through replay; off-by-one or mis-matched ids are the new flavor of suspension bug. Watch this carefully in Week 3.
 3. **Suspension semantics subtlety.** "When to suspend" (no more work to do *and* waiting on an uncompleted completable entry) has edge cases that look fine until a crash-recovery test fails. The `sdk-test-suite` is the safety net — run it early in Week 4.
 4. **NIF shortcut temptation.** Wrapping `sdk-shared-core` via Rustler would be ~1–2 weeks but NIF panics crash the BEAM scheduler — directly contradicts the "BEAM-native durability" story that justifies the SDK existing. Off the table for v0.1; revisit as a production-hardening option only once the pure-Elixir SDK exists.

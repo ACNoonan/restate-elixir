@@ -2,7 +2,7 @@ defmodule Restate.Protocol.MixProject do
   use Mix.Project
 
   @version "0.2.0"
-  @source_url "https://github.com/adamnoonan/restate-elixir"
+  @source_url "https://github.com/ACNoonan/restate-elixir"
 
   def project do
     [

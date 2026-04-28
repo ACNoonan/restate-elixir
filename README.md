@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: v0.2 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **49 / 49 official `sdk-test-suite` conformance tests passing across all targeted classes** — full clean sweep across cancellation, awaitable combinators, run retry policies, Workflow service type with durable promises, and lazy state. No Hex release yet.
+> **Status: v0.2.0 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **49 / 49 official `sdk-test-suite` conformance tests passing across all targeted classes** — full clean sweep across cancellation, awaitable combinators, run retry policies, Workflow service type with durable promises, and lazy state. `v0.2.0` git tag prepared; Hex publish pending.
 
 ## Why this exists
 
@@ -14,21 +14,26 @@ Independent validation of the thesis: in February 2026, George Guimarães (Plata
 
 Teams **already running Restate services** in TypeScript, Java, or Go who want to add Elixir handlers into a polyglot estate. This is not an attempt to win the Elixir-greenfield durable-workflow market against Oban or native alternatives — that's a crowded lane. The value here is making Elixir a first-class citizen of polyglot Restate deployments, which nobody else offers.
 
-## What's in scope for the MVP
+## What's implemented
+
+v0.2.0 ships beyond the original MVP plan. Concretely:
 
 - Restate service protocol **V5** (current; ~37 message types across control / Command / Notification namespaces)
-- **Service** type (stateless handlers)
-- **Virtual Object** type (keyed stateful handlers with serialized concurrency per key)
-- Journaled primitives implemented (v0.1 complete): `get_state` (eager), `set_state`, `clear_state`, `clear_all_state`, `state_keys`, `sleep`, `call`, `send`, `run`, `awakeable` + `complete_awakeable`
-- HTTP/2 endpoint via Bandit (REQUEST_RESPONSE protocol mode)
+- **Service**, **Virtual Object**, and **Workflow** service types
+- Journaled primitives: `get_state` (eager + lazy), `set_state`, `clear_state`, `clear_all_state`, `state_keys`, `sleep`, `call`, `send` (incl. `delayMillis`), `run` (with retry policies + flush), `awakeable` + `complete_awakeable`
+- Workflow durable promises: `get_promise`, `peek_promise`, `complete_promise`, `reject_promise`
+- Cancellation surface (`cancel_invocation` + built-in CANCEL signal id 1) and awaitable combinators (`Awaitable.any` / `all` / `await`)
+- HTTP/2 endpoint via Bandit, **REQUEST_RESPONSE** protocol mode
 - Discovery manifest at `GET /discover`
 - Terminal-vs-retryable error distinction (`Restate.TerminalError` → `OutputCommandMessage{failure}`; ordinary raise → `ErrorMessage{500}` → runtime retries)
-- Conformance subset from [restatedev/sdk-test-suite](https://github.com/restatedev/sdk-test-suite) — see [Conformance status](#conformance-status)
+- `Restate.Server.DrainCoordinator` + SIGTERM trap for graceful shutdown
+- Demos 1-5 all landed — see the `docs/demo-*.md` files linked under [Further reading](#further-reading)
+- 49 / 49 official `sdk-test-suite` conformance tests across `alwaysSuspending`, `lazyState`, and `lazyStateAlwaysSuspending` — see [Conformance status](#conformance-status)
 - Local K8s (`kind`) as the durability test bed
 
-**Explicitly deferred** to v0.2+: **Workflow** service type (lifecycle + versioning complexity), V6 protocol, Lambda transport, lazy state, full HTTP/2 streaming, production hardening, the four demos that surface BEAM-specific operational properties (see [PLAN.md](./PLAN.md#demos-beyond-the-mvp--making-the-beam-case)).
+**Carried to v0.3+**: full HTTP/2 same-stream suspend/resume (the bidirectional streaming optimisation — REQUEST_RESPONSE works in production but takes one extra round-trip per suspension), V6 protocol, Lambda transport, deeper production hardening (observability, backpressure tuning).
 
-See [PLAN.md](./PLAN.md) for the week-by-week scope and [PLAN.md#known-risks](./PLAN.md#known-risks) for the open technical risks.
+See [PLAN.md](./PLAN.md) for the original week-by-week MVP plan kept as historical context, and [PLAN.md#known-risks](./PLAN.md#known-risks) for the open technical risks.
 
 ## Quickstart
 
@@ -71,9 +76,9 @@ Requires `docker`, `kind`, `kubectl`, and the `restate` CLI.
 ```sh
 # 1. Build and load the handler image into the kind node
 docker compose build elixir-handler
-docker tag restate-elixir-elixir-handler:latest restate-elixir-handler:0.1.0
+docker tag restate-elixir-elixir-handler:latest restate-elixir-handler:0.2.0
 kind create cluster --name restate-elixir --config k8s/kind-config.yaml
-kind load docker-image restate-elixir-handler:0.1.0 --name restate-elixir
+kind load docker-image restate-elixir-handler:0.2.0 --name restate-elixir
 
 # 2. Deploy restate-server, the handler, and run the registration Job
 kubectl apply -f k8s/restate.yaml
@@ -204,11 +209,11 @@ restate runtime     ✅ StopRuntime       ✅ KillRuntime
 Reproduce locally: build the conformance image, then run the harness in `run` mode.
 
 ```sh
-docker build -t localhost/restate-elixir-handler:0.1.0 .
+docker build -t localhost/restate-elixir-handler:0.2.0 .
 java -jar restate-sdk-test-suite.jar run \
   --test-suite=alwaysSuspending \
   --image-pull-policy=CACHED \
-  localhost/restate-elixir-handler:0.1.0
+  localhost/restate-elixir-handler:0.2.0
 ```
 
 For iterative SDK development without rebuilding the image:
