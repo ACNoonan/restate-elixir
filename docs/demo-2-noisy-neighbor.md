@@ -101,8 +101,8 @@ Predicted P99 of `light` cohort: **~5,000 ms+** (the full block
 window). Ratio vs baseline: **~25×**.
 
 We didn't run that experiment yet — building a TS handler with
-the same shape and registering it as a sidecar service is a follow-up
-(see `PLAN.md` Demo 2 spec). The Elixir number stands on its own:
+the same shape and registering it as a sidecar service is a follow-up.
+The Elixir number stands on its own:
 **1.53× under saturation of every scheduler simultaneously, no
 failures, no timeouts.**
 

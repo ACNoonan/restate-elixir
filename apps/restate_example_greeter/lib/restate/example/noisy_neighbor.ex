@@ -1,7 +1,7 @@
 defmodule Restate.Example.NoisyNeighbor do
   @moduledoc """
-  Demo 2 (per [PLAN.md](../../PLAN.md#demos-beyond-the-mvp--making-the-beam-case))
-  — handler variants for the noisy-neighbor isolation experiment.
+  Demo 2 — handler variants for the noisy-neighbor isolation experiment.
+  Writeup: `docs/demo-2-noisy-neighbor.md`.
 
   Two handlers on the same VirtualObject:
 

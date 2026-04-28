@@ -4,8 +4,9 @@ defmodule Restate.Server.Manifest do
 
   Schema is defined in
   `apps/restate_protocol/proto/endpoint_manifest_schema.json`. We advertise
-  REQUEST_RESPONSE protocol mode (see PLAN.md — Bandit HTTP/2 full-duplex
-  is deferred past Week 1) and pin both min and max protocol versions to 5.
+  REQUEST_RESPONSE protocol mode (Bandit HTTP/2 same-stream full-duplex
+  streaming is the v0.3 carryover; see `docs/known-risks.md`) and pin both
+  min and max protocol versions to 5.
   """
 
   alias Restate.Server.Registry

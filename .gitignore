@@ -44,3 +44,6 @@ priv/native/
 
 # Conformance test reports — generated per run by sdk-test-suite
 /test_report/
+
+# Personal planning notes — kept locally, not part of the public repo
+PLAN.md

@@ -33,7 +33,7 @@ v0.2.0 ships beyond the original MVP plan. Concretely:
 
 **Carried to v0.3+**: full HTTP/2 same-stream suspend/resume (the bidirectional streaming optimisation — REQUEST_RESPONSE works in production but takes one extra round-trip per suspension), V6 protocol, Lambda transport, deeper production hardening (observability, backpressure tuning).
 
-See [PLAN.md](./PLAN.md) for the original week-by-week MVP plan kept as historical context, and [PLAN.md#known-risks](./PLAN.md#known-risks) for the open technical risks.
+See [docs/known-risks.md](./docs/known-risks.md) for the open technical risks behind the SDK's design choices.
 
 ## Quickstart
 
@@ -149,7 +149,6 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | Workflow service type + durable promises (`get_promise` / `peek_promise` / `complete_promise` / `reject_promise`) | ✓ (v0.2) |
 | Lazy state (`GetLazyStateCommandMessage` + `GetLazyStateKeysCommandMessage`, honors `StartMessage.partial_state`) | ✓ (v0.2) |
 | Full HTTP/2 same-stream suspend/resume | — v0.3 |
-| Graceful drain on `SIGTERM` (Demo 3 in [PLAN.md](./PLAN.md#demos-beyond-the-mvp--making-the-beam-case)) | — v0.2 |
 
 ## Conformance status
 
@@ -226,7 +225,7 @@ java -jar restate-sdk-test-suite.jar debug \
 
 ## Further reading
 
-- [PLAN.md](./PLAN.md) — week-by-week scope, demo roadmap (Demos 2–5 making the BEAM case), known risks
+- [docs/known-risks.md](./docs/known-risks.md) — the four open technical risks behind the SDK's design choices (Bandit HTTP/2 fallback, V5 Command/Notification correlation, suspension semantics, NIF shortcut)
 - [docs/demo-2-noisy-neighbor.md](./docs/demo-2-noisy-neighbor.md) — first BEAM-differentiated asset. **P99 of the light cohort inflates to 1.53× under 10 saturating-CPU poisoned handlers; P50 stays at 0.99×.** A single-event-loop runtime would block for the full 5-second poisoning window (~25× P99 inflation, predicted).
 - [docs/demo-3-graceful-drain.md](./docs/demo-3-graceful-drain.md) — `SIGTERM`-driven graceful drain. The SDK traps `SIGTERM`, lets every in-flight invocation finish, then exits. **20/20 in-flight `slow_op` invocations completed during a mid-flight drain, in the original 3 s budget, no retries.** ~150 LoC of `System.trap_signal/2` + `Process.monitor` + named-`:ets`-table; the BEAM gives us primitives Node.js / Java / Go have to build by hand.
 - [docs/demo-4-fan-out.md](./docs/demo-4-fan-out.md) — high-concurrency fan-out throughput, two shapes. **Fire-and-forget: 20,000 in-flight Restate invocations on a single elixir-handler pod, +1 MB peak memory over baseline, 2,489 leaves/sec sustained.** **Awakeable-based gather: 1,000 children fanned out + results aggregated in 1.86 s, two HTTP round-trips on the orchestrator side regardless of N.** Per-process generational GC keeps memory delta sublinear in concurrency.

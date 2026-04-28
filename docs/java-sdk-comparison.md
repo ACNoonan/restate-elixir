@@ -2,11 +2,11 @@
 
 A component-by-component side-by-side of `restate-elixir` against
 [`restatedev/sdk-java`](https://github.com/restatedev/sdk-java) — the
-canonical port target per [PLAN.md](../PLAN.md). Java is the only
-official Restate SDK with a pure-language state machine (the Rust /
-TypeScript / Python / Go SDKs all wrap a shared Rust core via WASM,
-PyO3, or cdylib bindings). Reading it line by line is the only way to
-write a faithful Elixir port; this doc records what that read found.
+canonical port target. Java is the only official Restate SDK with a
+pure-language state machine (the Rust / TypeScript / Python / Go SDKs
+all wrap a shared Rust core via WASM, PyO3, or cdylib bindings).
+Reading it line by line is the only way to write a faithful Elixir
+port; this doc records what that read found.
 
 > Java repo state: shallow clone of `main` at the time of writing
 > (matches v5/v6 protocol surface). Files referenced are at
@@ -78,9 +78,10 @@ What it buys us:
 - No Reactive Streams plumbing: no `Subscriber`, no `Publisher`, no
   `Subscription`, no demand signaling.
 
-PLAN.md flags this as the largest known risk (full-duplex HTTP/2 on
-Bandit). The decision to ship REQUEST_RESPONSE for v0.1 is documented
-there; this is the architectural cost.
+[Known risks](./known-risks.md) flags this as the largest open
+risk (full-duplex HTTP/2 on Bandit). The decision to ship
+REQUEST_RESPONSE for v0.1/v0.2 is documented there; this is the
+architectural cost.
 
 ### One process per invocation (Elixir) vs one Flow.Processor per invocation (Java)
 
@@ -98,8 +99,8 @@ memory footprint and shared thread pool contention.
 
 This is a real BEAM idiom: per-invocation isolation by default, no
 shared scheduler state, supervisor restarts a single bad invocation
-without touching the others. PLAN.md's Demo 2 (noisy neighbor) is
-specifically designed to surface this.
+without touching the others. [Demo 2 (noisy neighbor)](./demo-2-noisy-neighbor.md)
+is specifically designed to surface this.
 
 ### Sealed-interface state pattern (Java) vs flag-in-struct (Elixir)
 
@@ -327,9 +328,10 @@ discovery.
 These are intentional design choices, not gaps.
 
 1. **REQUEST_RESPONSE protocol mode.** Documented in
-   [PLAN.md known risks](../PLAN.md#known-risks) as the deferral of
-   Bandit HTTP/2 full-duplex streaming. Trade-off: each suspending
-   operation costs an extra HTTP round-trip; we keep the SDK simple.
+   [Known risks](./known-risks.md#1-bandit-http2-full-duplex-streaming)
+   as the deferral of Bandit HTTP/2 full-duplex streaming. Trade-off:
+   each suspending operation costs an extra HTTP round-trip; we keep
+   the SDK simple.
 
 2. **Lazy state.** ✓ Landed (v0.2). The SDK reads
    `StartMessage.partial_state` on init and falls back to
@@ -385,8 +387,7 @@ adds this section).
 
 ## v0.2 work surfaced by the read
 
-Beyond what PLAN.md already lists, these are additional v0.2 items
-the Java read makes concrete:
+The Java read made these v0.2 items concrete:
 
 - **Awaitable combinators** (`Awaitable.any`, `Awaitable.all`,
   `Awaitable.await`). ✓ Landed (v0.2). Implemented in

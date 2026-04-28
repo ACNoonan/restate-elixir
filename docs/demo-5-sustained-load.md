@@ -94,7 +94,7 @@ they don't recur.
 
 ## The full 24h test
 
-The proof-of-concept above runs at 50 RPS for 60 seconds. The PLAN.md
+The proof-of-concept above runs at 50 RPS for 60 seconds. The full-soak
 target is **500 RPS for 86,400 seconds** — same script, parameterised:
 
 ```sh

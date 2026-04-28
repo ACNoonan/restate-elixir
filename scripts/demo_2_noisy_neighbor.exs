@@ -1,7 +1,7 @@
 #!/usr/bin/env elixir
 #
 # Demo 2 — noisy-neighbor isolation. Drives the experiment described
-# in PLAN.md and apps/restate_example_greeter/lib/restate/example/noisy_neighbor.ex.
+# in apps/restate_example_greeter/lib/restate/example/noisy_neighbor.ex.
 #
 # What it does:
 #   1) Phase A (baseline)    — fires N concurrent `light` invocations,
