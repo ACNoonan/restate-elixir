@@ -32,7 +32,27 @@ See [PLAN.md](./PLAN.md) for the week-by-week scope and [PLAN.md#known-risks](./
 
 ## Quickstart
 
-### docker-compose
+### Add to your project (once published)
+
+```elixir
+# mix.exs
+def deps do
+  [
+    {:restate_server, "~> 0.2"}
+  ]
+end
+```
+
+`restate_server` brings in `restate_protocol` transitively. The
+user-facing API lives in the `Restate.*` namespace — `Restate.Context`
+for handler ops, `Restate.Awaitable` for combinators,
+`Restate.RetryPolicy` for `ctx.run` retry config,
+`Restate.TerminalError` for business-logic failures. Register
+your handlers via `Restate.Server.Registry.register_service/1`
+from your application's `start/2`. The Bandit endpoint runs on
+port 9080 by default.
+
+### Run the example handler — docker-compose
 
 Requires Docker and the `restate` CLI.
 
