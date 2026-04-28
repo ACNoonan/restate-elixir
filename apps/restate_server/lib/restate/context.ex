@@ -35,9 +35,17 @@ defmodule Restate.Context do
   """
   @spec get_state(t(), binary()) :: term() | nil
   def get_state(%__MODULE__{pid: pid}, key) when is_binary(key) do
-    case GenServer.call(pid, {:get_state, key}) do
-      nil -> nil
-      bytes when is_binary(bytes) -> Jason.decode!(bytes)
+    case GenServer.call(pid, {:get_state, key}, :infinity) do
+      nil ->
+        nil
+
+      bytes when is_binary(bytes) ->
+        Jason.decode!(bytes)
+
+      {:terminal_error, %Restate.TerminalError{} = exc} ->
+        # Cancellation hit during a lazy state fetch — surface to the
+        # handler the same way ctx.sleep/call/etc. do.
+        raise exc
     end
   end
 
@@ -71,7 +79,13 @@ defmodule Restate.Context do
   """
   @spec state_keys(t()) :: [binary()]
   def state_keys(%__MODULE__{pid: pid}) do
-    GenServer.call(pid, :state_keys)
+    case GenServer.call(pid, :state_keys, :infinity) do
+      keys when is_list(keys) ->
+        keys
+
+      {:terminal_error, %Restate.TerminalError{} = exc} ->
+        raise exc
+    end
   end
 
   @doc """

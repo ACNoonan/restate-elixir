@@ -1289,4 +1289,197 @@ defmodule Restate.Server.InvocationTest do
              ] = run(%Pb.StartMessage{}, nil, {PromiseGetter, :handle, 2}, replay)
     end
   end
+
+  describe "lazy state" do
+    defmodule LazyReader do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        v = Context.get_state(ctx, "k1")
+        %{got: v}
+      end
+    end
+
+    defmodule LazyKeys do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.state_keys(ctx)
+      end
+    end
+
+    test "partial_state=true + missing key: emits GetLazyStateCommand + Suspension" do
+      assert [
+               %Pb.GetLazyStateCommandMessage{key: "k1", result_completion_id: cid},
+               %Pb.SuspensionMessage{waiting_completions: [susp_cid]}
+             ] = run(%Pb.StartMessage{partial_state: true}, nil, {LazyReader, :handle, 2})
+
+      assert cid == 1
+      assert susp_cid == cid
+    end
+
+    test "partial_state=false + missing key: returns nil without emitting" do
+      # Eager state is the source of truth — no key, no value.
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{partial_state: false}, nil, {LazyReader, :handle, 2})
+
+      assert Jason.decode!(out) == %{"got" => nil}
+    end
+
+    test "partial_state=true: replay with Value notification returns the value" do
+      replay = [
+        %Pb.GetLazyStateCommandMessage{key: "k1", result_completion_id: 1},
+        %Pb.GetLazyStateCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:value, %Pb.Value{content: Jason.encode!(42)}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(%Pb.StartMessage{partial_state: true}, nil, {LazyReader, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"got" => 42}
+    end
+
+    test "partial_state=true: replay with Void notification returns nil" do
+      replay = [
+        %Pb.GetLazyStateCommandMessage{key: "k1", result_completion_id: 1},
+        %Pb.GetLazyStateCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(%Pb.StartMessage{partial_state: true}, nil, {LazyReader, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"got" => nil}
+    end
+
+    test "key in eager state_map: served from cache, no lazy fetch even with partial_state" do
+      start = %Pb.StartMessage{
+        partial_state: true,
+        state_map: [%Pb.StartMessage.StateEntry{key: "k1", value: Jason.encode!(7)}]
+      }
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(start, nil, {LazyReader, :handle, 2})
+
+      assert Jason.decode!(out) == %{"got" => 7}
+    end
+
+    test "state_keys with partial_state: emits GetLazyStateKeysCommand + Suspension" do
+      assert [
+               %Pb.GetLazyStateKeysCommandMessage{result_completion_id: cid},
+               %Pb.SuspensionMessage{waiting_completions: [susp_cid]}
+             ] = run(%Pb.StartMessage{partial_state: true}, nil, {LazyKeys, :handle, 2})
+
+      assert cid == 1
+      assert susp_cid == cid
+    end
+
+    test "state_keys with partial_state: replay returns the runtime keys" do
+      replay = [
+        %Pb.GetLazyStateKeysCommandMessage{result_completion_id: 1},
+        %Pb.GetLazyStateKeysCompletionNotificationMessage{
+          completion_id: 1,
+          state_keys: %Pb.StateKeys{keys: ["k1", "k2"]}
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(%Pb.StartMessage{partial_state: true}, nil, {LazyKeys, :handle, 2}, replay)
+
+      assert Enum.sort(Jason.decode!(out)) == ["k1", "k2"]
+    end
+
+    test "state_keys with partial_state=false: returns eager state_map keys (current behaviour)" do
+      start = %Pb.StartMessage{
+        partial_state: false,
+        state_map: [
+          %Pb.StartMessage.StateEntry{key: "k1", value: ~s(1)},
+          %Pb.StartMessage.StateEntry{key: "k2", value: ~s(2)}
+        ]
+      }
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(start, nil, {LazyKeys, :handle, 2})
+
+      assert Enum.sort(Jason.decode!(out)) == ["k1", "k2"]
+    end
+
+    defmodule LazyClearAll do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        Context.clear_all_state(ctx)
+        # After clear_all, state is known-empty — no lazy fetch needed.
+        v = Context.get_state(ctx, "k1")
+        keys = Context.state_keys(ctx)
+        %{got: v, keys: keys}
+      end
+    end
+
+    test "clear_all_state flips partial_state to false: subsequent reads don't lazy-fetch" do
+      start = %Pb.StartMessage{
+        partial_state: true,
+        state_map: [%Pb.StartMessage.StateEntry{key: "k1", value: ~s(1)}]
+      }
+
+      # No GetLazyStateCommand or GetLazyStateKeysCommand emitted —
+      # clear_all is the truth, no need to ask the runtime.
+      assert [
+               %Pb.ClearAllStateCommandMessage{},
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(start, nil, {LazyClearAll, :handle, 2})
+
+      assert Jason.decode!(out) == %{"got" => nil, "keys" => []}
+    end
+
+    defmodule LazyGetTwice do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        v1 = Context.get_state(ctx, "k1")
+        v2 = Context.get_state(ctx, "k1")
+        %{first: v1, second: v2}
+      end
+    end
+
+    test "lazy fetch is cached: second get_state for the same key doesn't re-emit" do
+      replay = [
+        %Pb.GetLazyStateCommandMessage{key: "k1", result_completion_id: 1},
+        %Pb.GetLazyStateCompletionNotificationMessage{
+          completion_id: 1,
+          result: {:value, %Pb.Value{content: Jason.encode!("hello")}}
+        }
+      ]
+
+      # Only ONE GetLazyStateCommand in the journal — the second
+      # get_state hits the in-memory cache populated by the first.
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] =
+               run(%Pb.StartMessage{partial_state: true}, nil, {LazyGetTwice, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"first" => "hello", "second" => "hello"}
+    end
+  end
 end

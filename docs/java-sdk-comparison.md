@@ -331,11 +331,16 @@ These are intentional design choices, not gaps.
    Bandit HTTP/2 full-duplex streaming. Trade-off: each suspending
    operation costs an extra HTTP round-trip; we keep the SDK simple.
 
-2. **Eager state only.** The `lazy-state` test suite tag is skipped.
-   We use `StartMessage.state_map` for all reads. For the demo
-   surface and the Counter test class this is sufficient. Lazy state
-   becomes necessary when per-invocation state exceeds the eager
-   bundle threshold (typically MB-scale single state values).
+2. **Lazy state.** ✓ Landed (v0.2). The SDK reads
+   `StartMessage.partial_state` on init and falls back to
+   `GetLazyStateCommandMessage` / `GetLazyStateKeysCommandMessage`
+   for keys not bundled in the eager `state_map`. Cache lives in
+   `state.state_map`: bytes for present values, `nil` sentinel for
+   "fetched and absent" or "explicitly cleared" — `Map.fetch/2`
+   distinguishes from "not yet probed." `clear_all_state` flips
+   `partial_state?` to false so subsequent reads short-circuit.
+   Conformance: `lazyState × 3` + `lazyStateAlwaysSuspending × 3`,
+   all green.
 
 3. **JSON-only payloads.** Our SDK assumes handler I/O is JSON. The
    `@Raw` handler annotation in the Java contract (`TestUtilsService.rawEcho`)

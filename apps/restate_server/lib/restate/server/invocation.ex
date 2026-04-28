@@ -69,7 +69,14 @@ defmodule Restate.Server.Invocation do
   # --- GenServer ---
 
   @impl true
-  def init({%Pb.StartMessage{id: start_message_id, state_map: state_entries, key: object_key}, input, replay_journal, mfa}) do
+  def init({%Pb.StartMessage{} = start, input, replay_journal, mfa}) do
+    %Pb.StartMessage{
+      id: start_message_id,
+      state_map: state_entries,
+      key: object_key,
+      partial_state: partial_state?
+    } = start
+
     state_map =
       for %Pb.StartMessage.StateEntry{key: k, value: v} <- state_entries, into: %{} do
         {k, v}
@@ -115,6 +122,13 @@ defmodule Restate.Server.Invocation do
      %{
        phase: phase,
        state_map: state_map,
+       # `StartMessage.partial_state` true means the runtime did not
+       # bundle every state value into the eager `state_map` —
+       # missing keys must be fetched via `GetLazyStateCommandMessage`.
+       # `nil` in `state_map` is the "fetched and absent" / "cleared"
+       # sentinel; `Map.fetch/2` distinguishes it from missing-from-map.
+       partial_state?: partial_state?,
+       state_keys_cache: nil,
        start_id: start_message_id,
        recorded_commands: recorded_commands,
        notifications: notifications,
@@ -140,8 +154,24 @@ defmodule Restate.Server.Invocation do
   end
 
   @impl true
-  def handle_call({:get_state, key}, _from, state) do
-    {:reply, Map.get(state.state_map, key), state}
+  def handle_call({:get_state, key}, from, state) do
+    case Map.fetch(state.state_map, key) do
+      {:ok, nil} ->
+        # Sentinel: explicitly cleared in this invocation, OR previously
+        # lazy-fetched and confirmed absent.
+        {:reply, nil, state}
+
+      {:ok, bytes} when is_binary(bytes) ->
+        {:reply, bytes, state}
+
+      :error ->
+        if state.partial_state? do
+          do_lazy_get_state(state, key, from)
+        else
+          # Eager state is the source of truth — missing means absent.
+          {:reply, nil, state}
+        end
+    end
   end
 
   @impl true
@@ -168,7 +198,10 @@ defmodule Restate.Server.Invocation do
 
   def handle_call(:clear_all_state, from, state) do
     cmd = %Pb.ClearAllStateCommandMessage{}
-    state = %{state | state_map: %{}}
+    # After clear_all the runtime has nothing — flip partial_state? to
+    # false so subsequent get_state returns nil locally without a wasted
+    # GetLazyStateCommand round-trip.
+    state = %{state | state_map: %{}, state_keys_cache: [], partial_state?: false}
 
     case state.phase do
       :replaying ->
@@ -185,16 +218,21 @@ defmodule Restate.Server.Invocation do
     end
   end
 
-  def handle_call(:state_keys, _from, state) do
-    # Read-only: returns all currently-set state keys from the eager
-    # state map. No journal entry — get_state and state_keys are pure
-    # reads against state we already have.
-    {:reply, Map.keys(state.state_map), state}
+  def handle_call(:state_keys, from, state) do
+    cond do
+      state.partial_state? and state.state_keys_cache == nil ->
+        do_lazy_state_keys(state, from)
+
+      true ->
+        {:reply, current_state_keys(state), state}
+    end
   end
 
   def handle_call({:clear_state, key}, from, state) do
     cmd = %Pb.ClearStateCommandMessage{key: key}
-    state = %{state | state_map: Map.delete(state.state_map, key)}
+    # nil sentinel = "explicitly cleared" — survives subsequent
+    # `get_state` without re-fetching from the runtime.
+    state = %{state | state_map: Map.put(state.state_map, key, nil)}
 
     case state.phase do
       :replaying ->
@@ -898,6 +936,7 @@ defmodule Restate.Server.Invocation do
 
   defp notification?(%Pb.SleepCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.GetLazyStateCompletionNotificationMessage{}), do: true
+  defp notification?(%Pb.GetLazyStateKeysCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.CallCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.CallInvocationIdCompletionNotificationMessage{}), do: true
   defp notification?(%Pb.RunCompletionNotificationMessage{}), do: true
@@ -910,6 +949,14 @@ defmodule Restate.Server.Invocation do
 
   defp notification_result(%Pb.CallInvocationIdCompletionNotificationMessage{invocation_id: id}),
     do: {:invocation_id, id}
+
+  defp notification_result(%Pb.GetLazyStateKeysCompletionNotificationMessage{
+         state_keys: %Pb.StateKeys{keys: keys}
+       }),
+       do: {:state_keys, keys || []}
+
+  defp notification_result(%Pb.GetLazyStateKeysCompletionNotificationMessage{}),
+    do: {:state_keys, []}
 
   defp notification_result(%{result: result}), do: result
   defp notification_result(_), do: :void
@@ -1029,6 +1076,137 @@ defmodule Restate.Server.Invocation do
         # journal we never see again.
         state
     end
+  end
+
+  # --- Lazy state ---
+  #
+  # `partial_state?` is true when the runtime did not bundle every
+  # state value into `StartMessage.state_map` (typically because the
+  # bundle would exceed a size threshold). Missing keys must be
+  # fetched via `GetLazyStateCommandMessage`; the full key set via
+  # `GetLazyStateKeysCommandMessage`.
+  #
+  # The cache lives in `state.state_map`: bytes for present values,
+  # `nil` for keys we know are absent (lazily fetched + Void, or
+  # explicitly cleared in this invocation), missing-from-map for
+  # keys we haven't probed yet.
+
+  defp do_lazy_get_state(state, key, from) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.GetLazyStateCommandMessage) do
+          if recorded.key == key do
+            state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+            handle_lazy_get_state_result(state, key, recorded.result_completion_id, from)
+          else
+            finalize_journal_mismatch(
+              state,
+              %Restate.ProtocolError{
+                message:
+                  "GetLazyState key mismatch: handler asked for " <>
+                    inspect(key) <> ", journal has " <> inspect(recorded.key),
+                code: Restate.ProtocolError.journal_mismatch()
+              },
+              from
+            )
+          end
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+        cmd = %Pb.GetLazyStateCommandMessage{key: key, result_completion_id: cid}
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, cid, from)
+        end
+    end
+  end
+
+  defp handle_lazy_get_state_result(state, key, result_completion_id, from) do
+    case Map.fetch(state.notifications, result_completion_id) do
+      {:ok, {:value, %Pb.Value{content: bytes}}} ->
+        state = %{state | state_map: Map.put(state.state_map, key, bytes)}
+        {:reply, bytes, state}
+
+      {:ok, {:void, _}} ->
+        state = %{state | state_map: Map.put(state.state_map, key, nil)}
+        {:reply, nil, state}
+
+      :error ->
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, result_completion_id, from)
+        end
+    end
+  end
+
+  defp do_lazy_state_keys(state, from) do
+    case state.phase do
+      :replaying ->
+        with {:ok, {recorded, rest}} <-
+               pop_recorded(state.recorded_commands, Pb.GetLazyStateKeysCommandMessage) do
+          state = state |> Map.put(:recorded_commands, rest) |> track_command(recorded) |> advance_phase()
+          handle_lazy_state_keys_result(state, recorded.result_completion_id, from)
+        else
+          {:error, exc} -> finalize_journal_mismatch(state, exc, from)
+        end
+
+      :processing ->
+        cid = state.next_completion_id
+        cmd = %Pb.GetLazyStateKeysCommandMessage{result_completion_id: cid}
+
+        state =
+          state
+          |> Map.update!(:emitted, &[cmd | &1])
+          |> Map.put(:next_completion_id, cid + 1)
+          |> track_command(cmd)
+
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, cid, from)
+        end
+    end
+  end
+
+  defp handle_lazy_state_keys_result(state, result_completion_id, from) do
+    case Map.fetch(state.notifications, result_completion_id) do
+      {:ok, {:state_keys, keys}} ->
+        state = %{state | state_keys_cache: keys}
+        {:reply, current_state_keys(state), state}
+
+      :error ->
+        if state.cancelled? do
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, result_completion_id, from)
+        end
+    end
+  end
+
+  # Runtime-known keys (cached from a prior GetLazyStateKeys, or empty
+  # when state is eager) merged with the local invocation's set/clear
+  # deltas. Cleared keys are stored as `{key, nil}` in state_map.
+  defp current_state_keys(state) do
+    cached = MapSet.new(state.state_keys_cache || [])
+
+    Enum.reduce(state.state_map, cached, fn
+      {k, nil}, acc -> MapSet.delete(acc, k)
+      {k, _bytes}, acc -> MapSet.put(acc, k)
+    end)
+    |> MapSet.to_list()
   end
 
   # promise_get: same shape as a Value-or-Failure-only completable
