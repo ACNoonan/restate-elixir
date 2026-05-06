@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: v0.2.0 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 + V6 (verified against `restate-server` 1.6.2; conformance was run under V5, V6 negotiation has unit-test coverage and is pending a re-run of the conformance suite under the v6 content-type). **49 / 49 official `sdk-test-suite` conformance tests passing across all targeted classes (V5)** — full clean sweep across cancellation, awaitable combinators, run retry policies, Workflow service type with durable promises, and lazy state. `v0.2.0` git tag prepared; Hex publish pending.
+> **Status: v0.2.0 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 + V6 (verified against `restate-server` 1.6.2; runtime negotiates V6 by default, confirmed via `deployment.service_protocol_version: V6` in the partition-state-machine logs). **202 / 202 official `sdk-test-suite` conformance tests passing across all eight test suites under V6** — clean sweep including `alwaysSuspending`, `default`, `lazyState`, `lazyStateAlwaysSuspending`, `persistedTimers`, `singleThreadSinglePartition`, `threeNodes`, `threeNodesAlwaysSuspending`. `v0.2.0` git tag prepared; Hex publish pending.
 
 ## Why this exists
 
@@ -28,7 +28,7 @@ v0.2.0 ships beyond the original MVP plan. Concretely:
 - Terminal-vs-retryable error distinction (`Restate.TerminalError` → `OutputCommandMessage{failure}`; ordinary raise → `ErrorMessage{500}` → runtime retries)
 - `Restate.Server.DrainCoordinator` + SIGTERM trap for graceful shutdown
 - Demos 1-5 all landed — see the `docs/demo-*.md` files linked under [Further reading](#further-reading)
-- 49 / 49 official `sdk-test-suite` conformance tests across `alwaysSuspending`, `lazyState`, and `lazyStateAlwaysSuspending` — see [Conformance status](#conformance-status)
+- 202 / 202 official `sdk-test-suite` conformance tests across all eight test suites (`alwaysSuspending`, `default`, `lazyState`, `lazyStateAlwaysSuspending`, `persistedTimers`, `singleThreadSinglePartition`, `threeNodes`, `threeNodesAlwaysSuspending`) under V6-negotiated invocations — see [Conformance status](#conformance-status)
 - Local K8s (`kind`) as the durability test bed
 
 **Carried to v0.3+**: full HTTP/2 same-stream suspend/resume (the bidirectional streaming optimisation — REQUEST_RESPONSE works in production but takes one extra round-trip per suspension), V7 protocol (Future-based `awaiting_on` and revised `SuspensionMessage`), Lambda transport, deeper production hardening (observability, backpressure tuning).
@@ -162,7 +162,9 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 
 Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk-test-suite/releases/tag/v4.1) (the official Restate conformance harness, also used by the Java/TS/Python/Go SDKs in CI).
 
-**v0.2: 49 / 49 across every targeted test class — full clean sweep across `alwaysSuspending`, `lazyState`, and `lazyStateAlwaysSuspending`.** v0.1's matrix plus the v0.2 cancellation surface (`KillInvocation` + `Cancellation × 6`), awaitable combinators (`Combinators × 3`), `ctx.run` retry policies (`RunRetry × 3` + `RunFlush × 1`), Workflow service type with durable promises (`WorkflowAPI.setAndResolve`), the `oneWayCallWithDelay` proxy fix, and lazy state (`State × 3` × 2 lazy suites). Zero failing or deferred classes in the targeted set.
+**Latest run (V6 negotiated): 202 / 202 across all eight test suites** (`alwaysSuspending` 42/42, `default` 39/39, `lazyState` 3/3, `lazyStateAlwaysSuspending` 3/3, `persistedTimers` 3/3, `singleThreadSinglePartition` 39/39, `threeNodes` 37/37, `threeNodesAlwaysSuspending` 36/36; `restate-server` 1.6.2; `service_protocol_version: V6` confirmed in the runtime's `PinnedDeployment` log). Reproduce with `elixir scripts/matrix_baseline.exs`.
+
+**Per-test-class detail (v0.2 clean sweep across the originally-targeted classes):**
 
 | Test class (suite) | Result | Notes |
 |---|---|---|
@@ -200,10 +202,11 @@ Run against [`restatedev/sdk-test-suite` v4.1](https://github.com/restatedev/sdk
 | `State × 3` (lazyState) | ✅ **v0.2** | same handlers under `partial_state: true`; SDK lazy-fetches via `GetLazyStateCommandMessage` |
 | `State × 3` (lazyStateAlwaysSuspending) | ✅ **v0.2** | lazy-state matrix with the always-suspend execution mode |
 
-**49 / 49 across all targeted test classes.** Notable v0.2 design points surfaced by the conformance suite:
+**202 / 202 across all eight test suites under V6** (clean sweep, exit 0). Notable v0.2/V6 design points surfaced by the conformance suite:
   * Cancel does not auto-cascade through `ctx.call` — the SDK emits an explicit `SendSignalCommand{idx: 1}` to the callee's invocation_id at the await site.
   * `ctx.run` retries happen synchronously inside the SDK with exponential backoff (matching `sdk-java`'s `RunState.java`); the runtime sees only the final `ProposeRunCompletion`. After exhaustion the SDK proposes a terminal failure so future replays are deterministic.
   * `ctx.run` suspends after each propose so the runtime can ack durable storage before the next side-effect runs — that's why `RunFlush` asserts the final response is 0 (every prior propose lives in the journal, none re-execute on the final replay).
+  * **Discovery quiescence gate** (`Restate.Server.Registry.wait_for_quiescence/2`): `/discover` waits until the registry has been quiet for 200ms before responding, so the per-test deployer never sees a partial service list during umbrella boot. Without this, `Combinators` + `default`-suite `UserErrors` tests intermittently 404'd on services registered late in `restate_test_services.Application.start/2` — a long-standing race that V6 conformance work surfaced.
 
 The four cells of the durability matrix are all green:
 
