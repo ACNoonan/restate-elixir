@@ -51,7 +51,13 @@ defmodule Restate.Server.MixProject do
       {:bandit, "~> 1.5"},
       {:plug, "~> 1.16"},
       {:jason, "~> 1.4"},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:telemetry, "~> 1.0"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      # Credo is an optional consumer dep — pulled in here so the
+      # `Restate.Credo.Checks.NonDeterminism` check can `use Credo.Check`.
+      # Users add Credo to their own project to actually run the check;
+      # see `Restate.Credo.Checks.NonDeterminism` for the config snippet.
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 
