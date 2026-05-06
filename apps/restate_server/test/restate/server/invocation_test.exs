@@ -36,8 +36,8 @@ defmodule Restate.Server.InvocationTest do
     replay_frames =
       Enum.map(replay, fn msg -> %Restate.Protocol.Frame{type: 0, flags: 0, message: msg} end)
 
-    {:ok, pid} = Invocation.start_link({start, input, replay_frames, mfa})
-    body = Invocation.await_response(pid)
+    {:ok, pid} = Invocation.start_link({start, input, replay_frames, mfa, %{}})
+    {_outcome, body} = Invocation.await_response(pid)
     {:ok, frames, ""} = Framer.decode_all(body)
     Enum.map(frames, & &1.message)
   end

@@ -1,12 +1,16 @@
 defmodule Restate.Server.Invocation do
   @moduledoc """
-  One process per HTTP invocation. Implements the V5 state machine:
+  One process per HTTP invocation. Implements the V5/V6 state machine:
   `:replaying` while there are recorded journal commands to consume,
   `:processing` once the handler has caught up to the head of the journal.
+  V5 and V6 share the same command/notification wire shape; V6 adds
+  `StartMessage.random_seed` (used to seed `:rand` in the handler
+  process for `Restate.Context.random_*`) and an official
+  `Failure.metadata` field (already supported under V5).
 
   ## Lifecycle
 
-      Endpoint → Invocation.start_link({start, input, replay_journal, mfa})
+      Endpoint → Invocation.start_link({start, input, replay_journal, mfa, dispatch_meta})
         ├─ Invocation partitions the post-Input replay frames:
         │     • recorded_commands (Set/Sleep/Output/...) — in order
         │     • notifications     — %{completion_id => :void | term}
@@ -48,20 +52,38 @@ defmodule Restate.Server.Invocation do
 
   `mfa` is `{module, function, arity}` — the function is called with
   `(%Restate.Context{}, input_value)`.
+
+  `dispatch_meta` is a `%{service: binary(), handler: binary()}` map
+  used as `:telemetry` metadata. Pass `%{}` from non-HTTP contexts
+  (tests) when the values aren't meaningful.
   """
   @spec start_link(
-          {Pb.StartMessage.t(), term(), [Frame.t()], {module(), atom(), arity()}}
+          {Pb.StartMessage.t(), term(), [Frame.t()], {module(), atom(), arity()}, map()}
         ) :: GenServer.on_start()
-  def start_link({%Pb.StartMessage{}, _input, replay_journal, _mfa} = arg)
-      when is_list(replay_journal) do
+  def start_link(
+        {%Pb.StartMessage{}, _input, replay_journal, _mfa, dispatch_meta} = arg
+      )
+      when is_list(replay_journal) and is_map(dispatch_meta) do
     GenServer.start_link(__MODULE__, arg)
   end
 
+  @typedoc """
+  Outcome tag returned by `await_response/2`. `:value` and
+  `:terminal_failure` are normal handler completions (the latter with
+  an `OutputCommandMessage{failure}` body); `:error` is a generic
+  exception that escaped the handler; `:suspended` means the runtime
+  must re-invoke us when a completion arrives; `:journal_mismatch` is
+  protocol code 570.
+  """
+  @type outcome ::
+          :value | :terminal_failure | :error | :suspended | :journal_mismatch
+
   @doc """
   Block until the handler completes (or suspends, or raises) and return
-  the framed response body. Stops the invocation process on return.
+  `{outcome, framed_response_body}`. Stops the invocation process on
+  return.
   """
-  @spec await_response(pid(), timeout()) :: binary()
+  @spec await_response(pid(), timeout()) :: {outcome(), binary()}
   def await_response(pid, timeout \\ 30_000) do
     GenServer.call(pid, :await_response, timeout)
   end
@@ -69,12 +91,18 @@ defmodule Restate.Server.Invocation do
   # --- GenServer ---
 
   @impl true
-  def init({%Pb.StartMessage{} = start, input, replay_journal, mfa}) do
+  def init({%Pb.StartMessage{} = start, input, replay_journal, mfa, dispatch_meta}) do
     %Pb.StartMessage{
       id: start_message_id,
       state_map: state_entries,
       key: object_key,
-      partial_state: partial_state?
+      partial_state: partial_state?,
+      # `random_seed` is a V6 addition (`uint64`, field 9). Under V5
+      # the runtime leaves it at the default 0; under V6 it carries
+      # a stable per-invocation seed used to seed the handler
+      # process's `:rand` state so `Restate.Context.random_*` is
+      # deterministic across replays.
+      random_seed: random_seed
     } = start
 
     state_map =
@@ -103,6 +131,17 @@ defmodule Restate.Server.Invocation do
 
     handler_pid =
       spawn_link(fn ->
+        # Seed `:rand` in the handler process so `Restate.Context.random_*`
+        # produces the same stream on every replay (`random_seed` is
+        # the same in every StartMessage for this invocation under V6).
+        # Under V5 the seed is 0 and we skip seeding — `Context.random_*`
+        # callers will still get *a* number, but it'll be the BEAM's
+        # default non-deterministic seed and replays will diverge. The
+        # SDK README documents that `Context.random_*` requires V6.
+        if is_integer(random_seed) and random_seed > 0 do
+          :rand.seed(:exsss, random_seed)
+        end
+
         ctx = %Restate.Context{pid: parent, key: object_key || ""}
         {mod, fun, _arity} = mfa
 
@@ -121,6 +160,22 @@ defmodule Restate.Server.Invocation do
     {:ok,
      %{
        phase: phase,
+       # Snapshotted at init so `:replay_complete` can report how many
+       # recorded commands existed when this invocation started.
+       replay_journal_size: length(recorded_commands),
+       # Flipped to true the one time `advance_phase/1` transitions us
+       # from `:replaying` to `:processing`. Reported in the `:stop`
+       # event metadata so dashboards can distinguish first-run from
+       # resumption invocations.
+       replay_phase_completed?: false,
+       # `%{service: binary, handler: binary}` for telemetry metadata.
+       # Endpoint populates it; tests may pass `%{}` when service /
+       # handler don't matter.
+       dispatch_meta: dispatch_meta,
+       # Set at every `finalize/3` site to one of the values in the
+       # `outcome` typedoc. Returned alongside the wire body from
+       # `await_response/2` and reported in `:stop` event metadata.
+       outcome: nil,
        state_map: state_map,
        # `StartMessage.partial_state` true means the runtime did not
        # bundle every state value into the eager `state_map` —
@@ -806,8 +861,9 @@ defmodule Restate.Server.Invocation do
 
   # The endpoint and the handler run concurrently — either could complete
   # first. We resolve the race by stashing whatever's missing.
-  def handle_call(:await_response, _from, %{result_body: body} = state) when is_binary(body) do
-    {:stop, :normal, body, state}
+  def handle_call(:await_response, _from, %{result_body: body, outcome: outcome} = state)
+      when is_binary(body) do
+    {:stop, :normal, {outcome, body}, state}
   end
 
   def handle_call(:await_response, from, state) do
@@ -820,7 +876,7 @@ defmodule Restate.Server.Invocation do
       result: {:value, %Pb.Value{content: Jason.encode!(value)}}
     }
 
-    finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), state)
+    finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), :value, state)
   end
 
   def handle_info({:handler_result, {:error, %Restate.TerminalError{} = e, _stack}}, state) do
@@ -838,7 +894,11 @@ defmodule Restate.Server.Invocation do
          %Pb.Failure{code: e.code, message: e.message || "", metadata: metadata}}
     }
 
-    finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), state)
+    finalize(
+      encode_response(state.emitted, [output, %Pb.EndMessage{}]),
+      :terminal_failure,
+      state
+    )
   end
 
   def handle_info({:handler_result, {:error, exception, stacktrace}}, state) do
@@ -863,7 +923,7 @@ defmodule Restate.Server.Invocation do
     #   * 500   — generic handler failure; runtime retries.
     #   * 570   — JOURNAL_MISMATCH; runtime stops, surfaces to operator.
     #   * 571   — PROTOCOL_VIOLATION; same.
-    finalize(encode_response(state.emitted, [err]), state)
+    finalize(encode_response(state.emitted, [err]), :error, state)
   end
 
   # --- helpers ---
@@ -923,8 +983,12 @@ defmodule Restate.Server.Invocation do
   end
 
   # SignalNotificationMessage uses oneof id: completion_id | signal_id |
-  # signal_name. For awakeable support we care about signal_id; others
-  # are out of v0.1 scope.
+  # signal_name. We handle the indexed signal_id branch (used by
+  # awakeables, signal_id 1 for CANCEL, and the user-allocated 17+
+  # range). The signal_name branch is reserved for named external
+  # signals — not exercised by the current conformance suite or any
+  # shipped handler API; would land alongside a future
+  # `Restate.Context.named_signal/2` if/when that's introduced.
   defp signal_notification?(%Pb.SignalNotificationMessage{}), do: true
   defp signal_notification?(_), do: false
 
@@ -1508,7 +1572,7 @@ defmodule Restate.Server.Invocation do
     }
 
     body = encode_response(state.emitted, [suspension])
-    finalize(body, state)
+    finalize(body, :suspended, state)
   end
 
   # Propagate cancel to any in-flight call handles. Sleep + awakeable +
@@ -1534,7 +1598,7 @@ defmodule Restate.Server.Invocation do
     }
 
     body = encode_response(state.emitted, [suspension])
-    finalize(body, state)
+    finalize(body, :suspended, state)
   end
 
   defp decode_failure_metadata(nil), do: %{}
@@ -1548,14 +1612,36 @@ defmodule Restate.Server.Invocation do
   # the Invocation exits :normal, the handler's call detects DOWN and the
   # handler exits — same close-out shape as suspension.
   defp finalize_journal_mismatch(state, %Restate.ProtocolError{} = exc, _from) do
+    :telemetry.execute(
+      [:restate, :invocation, :journal_mismatch],
+      %{monotonic_time: System.monotonic_time()},
+      Map.merge(state.dispatch_meta, %{
+        code: exc.code,
+        message: exc.message,
+        command_index: state.current_command.index
+      })
+    )
+
     err =
       %Pb.ErrorMessage{code: exc.code, message: exc.message}
       |> with_related_command(state.current_command)
 
-    finalize(encode_response(state.emitted, [err]), state)
+    finalize(encode_response(state.emitted, [err]), :journal_mismatch, state)
   end
 
-  defp advance_phase(%{recorded_commands: []} = state), do: %{state | phase: :processing}
+  defp advance_phase(%{phase: :replaying, recorded_commands: []} = state) do
+    :telemetry.execute(
+      [:restate, :invocation, :replay_complete],
+      %{
+        monotonic_time: System.monotonic_time(),
+        replayed_commands: state.replay_journal_size
+      },
+      state.dispatch_meta
+    )
+
+    %{state | phase: :processing, replay_phase_completed?: true}
+  end
+
   defp advance_phase(state), do: state
 
   # Bump current_command tracking after a command is consumed (replay) or
@@ -1612,16 +1698,19 @@ defmodule Restate.Server.Invocation do
     }
 
     body = encode_response(state.emitted, [suspension])
-    finalize(body, state)
+    finalize(body, :suspended, state)
   end
 
-  defp finalize(body, %{awaiting_response: nil} = state) do
-    {:noreply, %{state | result_body: body}}
+  # `outcome` is one of `:value | :terminal_failure | :error |
+  # :suspended | :journal_mismatch` and is returned alongside the
+  # body from `await_response/2`.
+  defp finalize(body, outcome, %{awaiting_response: nil} = state) do
+    {:noreply, %{state | result_body: body, outcome: outcome}}
   end
 
-  defp finalize(body, %{awaiting_response: from} = state) do
-    GenServer.reply(from, body)
-    {:stop, :normal, state}
+  defp finalize(body, outcome, %{awaiting_response: from} = state) do
+    GenServer.reply(from, {outcome, body})
+    {:stop, :normal, %{state | outcome: outcome}}
   end
 
   defp encode_response(emitted_reversed, trailing) do

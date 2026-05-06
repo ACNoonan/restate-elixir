@@ -5,19 +5,38 @@ defmodule Restate.Server.Manifest do
   Schema is defined in
   `apps/restate_protocol/proto/endpoint_manifest_schema.json`. We advertise
   REQUEST_RESPONSE protocol mode (Bandit HTTP/2 same-stream full-duplex
-  streaming is the v0.3 carryover; see `docs/known-risks.md`) and pin both
-  min and max protocol versions to 5.
+  streaming is the v0.3 carryover; see `docs/known-risks.md`) and the
+  protocol-version range we accept on `/invoke`.
+
+  V5 is the original V5 command/notification split (immutable journal,
+  separate completions). V6 adds two things: `StartMessage.random_seed`
+  for deterministic per-invocation RNG (`Restate.Context.random_*`) and
+  a typed `Failure.metadata` field. We already implemented metadata on
+  V5 (the runtime is permissive); V6 makes it official and also lights
+  up the random-seed API. V7 changes suspension semantics — Future-based
+  `awaiting_on` — and is the next bump (carried to a future release).
   """
 
   alias Restate.Server.Registry
+
+  @min_protocol_version 5
+  @max_protocol_version 6
+
+  @doc "Lowest service-protocol version this SDK will accept."
+  @spec min_protocol_version() :: pos_integer()
+  def min_protocol_version, do: @min_protocol_version
+
+  @doc "Highest service-protocol version this SDK will accept."
+  @spec max_protocol_version() :: pos_integer()
+  def max_protocol_version, do: @max_protocol_version
 
   @doc "Build the manifest map from the live service registry."
   @spec build() :: map()
   def build do
     %{
       protocolMode: "REQUEST_RESPONSE",
-      minProtocolVersion: 5,
-      maxProtocolVersion: 5,
+      minProtocolVersion: @min_protocol_version,
+      maxProtocolVersion: @max_protocol_version,
       services: Enum.map(Registry.list_services(), &service_to_manifest/1)
     }
   end

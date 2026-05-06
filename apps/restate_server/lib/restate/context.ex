@@ -287,10 +287,15 @@ defmodule Restate.Context do
   @doc """
   Create an awakeable. Returns `{awakeable_id, handle}` where:
 
-    * `awakeable_id` — an opaque string of the form `"prom_1<base64>"`
+    * `awakeable_id` — an opaque string of the form `"sign_1<base64>"`
       that other handlers (or external code) can use to complete this
       awakeable via `complete_awakeable/3` or `reject_awakeable/4`.
-      Pass it across the wire freely.
+      Pass it across the wire freely. (V5 routes awakeables via
+      `ExternalSignalIdentifier`, prefix `sign_1`; the older `prom_1`
+      prefix maps to V1–V4's `AwakeableIdentifier` and produces
+      "no command in journal for completion index N" errors when
+      sent to a V5 server. See `Restate.Server.Invocation.encode_awakeable_id/2`
+      for the routing detail.)
     * `handle` — opaque token for `await_awakeable/2` later in this
       same handler.
 
@@ -561,5 +566,67 @@ defmodule Restate.Context do
           do_run_with_retry(ctx, cid, fun, policy, attempt + 1)
         end
     end
+  end
+
+  # --- Deterministic randomness (V6 service-protocol) ---
+  #
+  # Under V6, the runtime carries a stable `random_seed` in every
+  # `StartMessage`. The handler process is seeded from it once at
+  # spawn time (see `Restate.Server.Invocation.init/1`), so every
+  # subsequent `:rand` call inside the handler produces the same
+  # sequence on the original run and on every replay. These wrappers
+  # are the documented API; calling `:rand.*` directly will work but
+  # is flagged by `Restate.Credo.Checks.NonDeterminism` because
+  # nothing pins the seeding contract for future SDK versions.
+  #
+  # Under V5 the seed is 0 and the handler process inherits BEAM's
+  # default non-deterministic seeding — values will diverge across
+  # replays. Use `ctx.run/2` instead until you negotiate V6, or pin
+  # `Restate.Server.Manifest.max_protocol_version/0` to 6 in
+  # production.
+
+  @doc """
+  Deterministic uniform float in `[0.0, 1.0)`.
+
+  Same call sequence + same `StartMessage.random_seed` produces the
+  same value on every replay. Requires service protocol V6.
+  """
+  @spec random_uniform(t()) :: float()
+  def random_uniform(%__MODULE__{}), do: :rand.uniform()
+
+  @doc """
+  Deterministic uniform integer in `1..n`.
+
+  See `random_uniform/1` for the determinism contract.
+  """
+  @spec random_uniform(t(), pos_integer()) :: pos_integer()
+  def random_uniform(%__MODULE__{}, n) when is_integer(n) and n > 0, do: :rand.uniform(n)
+
+  @doc """
+  Deterministic random binary of `n` bytes.
+
+  See `random_uniform/1` for the determinism contract.
+  """
+  @spec random_bytes(t(), non_neg_integer()) :: binary()
+  def random_bytes(%__MODULE__{}, n) when is_integer(n) and n >= 0, do: :rand.bytes(n)
+
+  @doc """
+  Deterministic v4-shaped UUID string (e.g. `"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"`).
+
+  Uses 16 bytes from the seeded RNG with the v4 / variant-1 bits set
+  per RFC 4122. Same `StartMessage.random_seed` and same call
+  sequence produces the same UUID on every replay. Requires service
+  protocol V6.
+  """
+  @spec random_uuid(t()) :: String.t()
+  def random_uuid(%__MODULE__{} = _ctx) do
+    <<a::32, b::16, c::16, d::16, e::48>> = :rand.bytes(16)
+    # Force v4 nibble (top 4 bits of the 7th byte = 0b0100) and the
+    # RFC 4122 variant nibble (top 2 bits of the 9th byte = 0b10).
+    c4 = Bitwise.bor(Bitwise.band(c, 0x0FFF), 0x4000)
+    d4 = Bitwise.bor(Bitwise.band(d, 0x3FFF), 0x8000)
+
+    :io_lib.format(~c"~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b", [a, b, c4, d4, e])
+    |> IO.iodata_to_binary()
   end
 end

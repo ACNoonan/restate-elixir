@@ -46,7 +46,7 @@ defmodule Restate.Server.EndpointTest do
       manifest = Jason.decode!(conn.resp_body)
       assert manifest["protocolMode"] == "REQUEST_RESPONSE"
       assert manifest["minProtocolVersion"] == 5
-      assert manifest["maxProtocolVersion"] == 5
+      assert manifest["maxProtocolVersion"] == 6
 
       assert [
                %{
@@ -134,6 +134,61 @@ defmodule Restate.Server.EndpointTest do
     test "404 for arbitrary paths" do
       conn = :get |> conn("/nope") |> Endpoint.call(@opts)
       assert conn.status == 404
+    end
+
+    test "V6 negotiation: response mirrors request content-type" do
+      conn =
+        :post
+        |> conn("/invoke/Greeter/count", invocation_body())
+        |> put_req_header("content-type", "application/vnd.restate.invocation.v6")
+        |> Endpoint.call(@opts)
+
+      assert conn.status == 200
+
+      assert get_resp_header(conn, "content-type") == [
+               "application/vnd.restate.invocation.v6"
+             ]
+    end
+
+    test "415 when content-type is below the advertised range" do
+      conn =
+        :post
+        |> conn("/invoke/Greeter/count", invocation_body())
+        |> put_req_header("content-type", "application/vnd.restate.invocation.v4")
+        |> Endpoint.call(@opts)
+
+      assert conn.status == 415
+      assert conn.resp_body =~ "v5..v6"
+    end
+
+    test "415 when content-type is above the advertised range" do
+      conn =
+        :post
+        |> conn("/invoke/Greeter/count", invocation_body())
+        |> put_req_header("content-type", "application/vnd.restate.invocation.v7")
+        |> Endpoint.call(@opts)
+
+      assert conn.status == 415
+    end
+
+    test "415 when content-type is missing" do
+      conn =
+        :post
+        |> conn("/invoke/Greeter/count", invocation_body())
+        |> Endpoint.call(@opts)
+
+      assert conn.status == 415
+      assert conn.resp_body =~ "missing content-type"
+    end
+
+    test "415 when content-type is malformed" do
+      conn =
+        :post
+        |> conn("/invoke/Greeter/count", invocation_body())
+        |> put_req_header("content-type", "application/json")
+        |> Endpoint.call(@opts)
+
+      assert conn.status == 415
     end
   end
 
