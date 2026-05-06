@@ -40,6 +40,13 @@ defmodule Restate.Server.Endpoint do
   plug :dispatch
 
   get "/discover" do
+    # Wait for the registry to settle before responding. Umbrella
+    # apps register their services from `Application.start/2`, which
+    # runs *after* `restate_server` (because they depend on it), so
+    # the very first /discover after boot can race and return a
+    # partial manifest. See `Restate.Server.Registry.wait_for_quiescence/2`.
+    Registry.wait_for_quiescence()
+
     body = Manifest.build() |> Jason.encode!()
 
     conn
