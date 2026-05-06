@@ -3,80 +3,22 @@ defmodule Restate.Example.Greeter.Application do
 
   use Application
 
+  # Service modules — each one declares its public name + handler
+  # surface via `use Restate.Service` + `@handler` annotations. The
+  # registration loop below collects their `__restate_service__/0`
+  # maps and registers them with `Restate.Server.Registry`.
+  @services [
+    Restate.Example.Greeter,
+    Restate.Example.Fanout.Orchestrator,
+    Restate.Example.Fanout.Leaf,
+    Restate.Example.NoisyNeighbor
+  ]
+
   @impl true
   def start(_type, _args) do
-    Restate.Server.Registry.register_service(%{
-      name: "Greeter",
-      type: :virtual_object,
-      handlers: [
-        %{
-          name: "count",
-          type: :exclusive,
-          mfa: {Restate.Example.Greeter, :count, 2}
-        },
-        %{
-          name: "long_greet",
-          type: :exclusive,
-          mfa: {Restate.Example.Greeter, :long_greet, 2}
-        }
-      ]
-    })
-
-    Restate.Server.Registry.register_service(%{
-      name: "FanoutOrchestrator",
-      type: :virtual_object,
-      handlers: [
-        %{
-          name: "run",
-          type: :exclusive,
-          mfa: {Restate.Example.Fanout.Orchestrator, :run, 2}
-        },
-        %{
-          name: "gather",
-          type: :exclusive,
-          mfa: {Restate.Example.Fanout.Orchestrator, :gather, 2}
-        }
-      ]
-    })
-
-    Restate.Server.Registry.register_service(%{
-      name: "FanoutLeaf",
-      type: :service,
-      handlers: [
-        %{
-          name: "process",
-          type: nil,
-          mfa: {Restate.Example.Fanout.Leaf, :process, 2}
-        },
-        %{
-          name: "complete",
-          type: nil,
-          mfa: {Restate.Example.Fanout.Leaf, :complete, 2}
-        }
-      ]
-    })
-
-    Restate.Server.Registry.register_service(%{
-      name: "NoisyNeighbor",
-      type: :virtual_object,
-      handlers: [
-        %{
-          name: "light",
-          type: :exclusive,
-          mfa: {Restate.Example.NoisyNeighbor, :light, 2}
-        },
-        %{
-          name: "poisoned",
-          type: :exclusive,
-          mfa: {Restate.Example.NoisyNeighbor, :poisoned, 2}
-        },
-        %{
-          name: "slow_op",
-          type: :exclusive,
-          mfa: {Restate.Example.NoisyNeighbor, :slow_op, 2}
-        }
-      ]
-    })
+    Enum.each(@services, fn mod ->
+      Restate.Server.Registry.register_service(mod.__restate_service__())
+    end)
 
     Supervisor.start_link([], strategy: :one_for_one, name: Restate.Example.Greeter.Supervisor)
   end

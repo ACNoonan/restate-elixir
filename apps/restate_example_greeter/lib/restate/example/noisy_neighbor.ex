@@ -31,17 +31,20 @@ defmodule Restate.Example.NoisyNeighbor do
   request for the full 5 seconds. P99 spikes to 5 s+ for the duration.
   """
 
+  use Restate.Service, type: :virtual_object
   alias Restate.Context
 
   @poison_duration_ms 5_000
   @slow_duration_ms 3_000
 
+  @handler type: :exclusive
   def light(%Context{} = ctx, _input) do
     n = (Context.get_state(ctx, "n") || 0) + 1
     Context.set_state(ctx, "n", n)
     %{n: n}
   end
 
+  @handler type: :exclusive
   def poisoned(%Context{} = _ctx, _input) do
     burn_until(:os.system_time(:millisecond) + @poison_duration_ms, 0)
   end
@@ -55,6 +58,7 @@ defmodule Restate.Example.NoisyNeighbor do
   meaning the handler stays in our pod's process table for the full
   duration. SIGTERM-triggered drain must wait for it to finish.
   """
+  @handler type: :exclusive
   def slow_op(%Context{} = ctx, _input) do
     Context.set_state(ctx, "step", "started")
     :timer.sleep(@slow_duration_ms)

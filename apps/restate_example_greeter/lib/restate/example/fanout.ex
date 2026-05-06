@@ -53,8 +53,10 @@ defmodule Restate.Example.Fanout do
   """
 
   defmodule Orchestrator do
+    use Restate.Service, name: "FanoutOrchestrator", type: :virtual_object
     alias Restate.Context
 
+    @handler type: :exclusive
     def run(%Context{} = ctx, %{"size" => n}) when is_integer(n) and n > 0 do
       Enum.each(1..n, fn task_id ->
         Context.send_async(ctx, "FanoutLeaf", "process", %{"task_id" => task_id})
@@ -89,6 +91,7 @@ defmodule Restate.Example.Fanout do
     `{task_id, awakeable_id, handle}` (~50 B each), then walks them
     in a flat enum. Memory delta in N is linear and tiny.
     """
+    @handler type: :exclusive
     def gather(%Context{} = ctx, %{"size" => n}) when is_integer(n) and n > 0 do
       awakeables =
         Enum.map(1..n, fn task_id ->
@@ -114,12 +117,14 @@ defmodule Restate.Example.Fanout do
   end
 
   defmodule Leaf do
+    use Restate.Service, name: "FanoutLeaf", type: :service
     alias Restate.Context
 
     @doc """
     Fire-and-forget leaf — pure compute, no journaled side effect.
     Used by `Orchestrator.run/2`.
     """
+    @handler []
     def process(_ctx, %{"task_id" => task_id}) when is_integer(task_id) do
       %{task_id: task_id, ok: true}
     end
@@ -129,6 +134,7 @@ defmodule Restate.Example.Fanout do
     Computes a result and signals it back to the parent via the
     awakeable id passed in the input.
     """
+    @handler []
     def complete(%Context{} = ctx, %{"task_id" => task_id, "awakeable_id" => awakeable_id})
         when is_integer(task_id) and is_binary(awakeable_id) do
       Context.complete_awakeable(ctx, awakeable_id, %{

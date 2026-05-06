@@ -13,16 +13,19 @@ defmodule Restate.Example.Greeter do
       past the completed sleep.
   """
 
+  use Restate.Service, type: :virtual_object
   alias Restate.Context
 
   @sleep_ms 10_000
 
+  @handler type: :exclusive
   def count(%Context{} = ctx, _input) do
     n = (Context.get_state(ctx, "counter") || 0) + 1
     Context.set_state(ctx, "counter", n)
     "hello #{n}"
   end
 
+  @handler type: :exclusive
   def long_greet(%Context{} = ctx, name) do
     Context.set_state(ctx, "step", "started")
     Context.sleep(ctx, @sleep_ms)
