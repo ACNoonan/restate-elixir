@@ -12,6 +12,7 @@ COPY apps/restate_protocol/mix.exs apps/restate_protocol/
 COPY apps/restate_server/mix.exs apps/restate_server/
 COPY apps/restate_example_greeter/mix.exs apps/restate_example_greeter/
 COPY apps/restate_test_services/mix.exs apps/restate_test_services/
+COPY apps/restate_test_harness/mix.exs apps/restate_test_harness/
 RUN mix deps.get --only prod && mix deps.compile
 
 COPY apps apps

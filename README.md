@@ -2,7 +2,7 @@
 
 Elixir SDK for [Restate](https://restate.dev) — a durable execution runtime.
 
-> **Status: v0.2.0 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 (verified against `restate-server` 1.6.2). **49 / 49 official `sdk-test-suite` conformance tests passing across all targeted classes** — full clean sweep across cancellation, awaitable combinators, run retry policies, Workflow service type with durable promises, and lazy state. `v0.2.0` git tag prepared; Hex publish pending.
+> **Status: v0.2.0 feature-complete; pre-alpha quality.** Greenfield project started 2026-04-24. Targeting Restate service protocol V5 + V6 (verified against `restate-server` 1.6.2; conformance was run under V5, V6 negotiation has unit-test coverage and is pending a re-run of the conformance suite under the v6 content-type). **49 / 49 official `sdk-test-suite` conformance tests passing across all targeted classes (V5)** — full clean sweep across cancellation, awaitable combinators, run retry policies, Workflow service type with durable promises, and lazy state. `v0.2.0` git tag prepared; Hex publish pending.
 
 ## Why this exists
 
@@ -18,7 +18,7 @@ Teams **already running Restate services** in TypeScript, Java, or Go who want t
 
 v0.2.0 ships beyond the original MVP plan. Concretely:
 
-- Restate service protocol **V5** (current; ~37 message types across control / Command / Notification namespaces)
+- Restate service protocol **V5 + V6** (negotiated per request; ~37 message types across control / Command / Notification namespaces). V6 adds `StartMessage.random_seed` (consumed by `Restate.Context.random_uniform/1,2`, `random_bytes/2`, `random_uuid/1` for deterministic-across-replays randomness without `ctx.run`) and an official `Failure.metadata` field (already supported under V5)
 - **Service**, **Virtual Object**, and **Workflow** service types
 - Journaled primitives: `get_state` (eager + lazy), `set_state`, `clear_state`, `clear_all_state`, `state_keys`, `sleep`, `call`, `send` (incl. `delayMillis`), `run` (with retry policies + flush), `awakeable` + `complete_awakeable`
 - Workflow durable promises: `get_promise`, `peek_promise`, `complete_promise`, `reject_promise`
@@ -31,7 +31,7 @@ v0.2.0 ships beyond the original MVP plan. Concretely:
 - 49 / 49 official `sdk-test-suite` conformance tests across `alwaysSuspending`, `lazyState`, and `lazyStateAlwaysSuspending` — see [Conformance status](#conformance-status)
 - Local K8s (`kind`) as the durability test bed
 
-**Carried to v0.3+**: full HTTP/2 same-stream suspend/resume (the bidirectional streaming optimisation — REQUEST_RESPONSE works in production but takes one extra round-trip per suspension), V6 protocol, Lambda transport, deeper production hardening (observability, backpressure tuning).
+**Carried to v0.3+**: full HTTP/2 same-stream suspend/resume (the bidirectional streaming optimisation — REQUEST_RESPONSE works in production but takes one extra round-trip per suspension), V7 protocol (Future-based `awaiting_on` and revised `SuspensionMessage`), Lambda transport, deeper production hardening (observability, backpressure tuning).
 
 See [docs/known-risks.md](./docs/known-risks.md) for the open technical risks behind the SDK's design choices.
 
@@ -126,7 +126,9 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | Area | State |
 |---|---|
 | Protocol framing (encode/decode, V5 type registry) | ✓ |
-| Discovery manifest at `GET /discover` (REQUEST_RESPONSE, V5) | ✓ |
+| Discovery manifest at `GET /discover` (REQUEST_RESPONSE, V5..V6) | ✓ |
+| Per-request V5/V6 protocol negotiation via `content-type` (415 on out-of-range) | ✓ (unreleased) |
+| Deterministic randomness (`Restate.Context.random_uniform/1,2`, `random_bytes/2`, `random_uuid/1` fed by V6 `StartMessage.random_seed`) | ✓ (unreleased) |
 | `Restate.Context.get_state` / `set_state` / `clear_state` | ✓ (eager) |
 | `Restate.Context.sleep` + `SuspensionMessage` + journal replay | ✓ |
 | `Restate.Context.key/1` (per-VirtualObject path segment) | ✓ |
@@ -148,7 +150,13 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | `ctx.run` flush (suspend-after-propose for durability) | ✓ (v0.2) |
 | Workflow service type + durable promises (`get_promise` / `peek_promise` / `complete_promise` / `reject_promise`) | ✓ (v0.2) |
 | Lazy state (`GetLazyStateCommandMessage` + `GetLazyStateKeysCommandMessage`, honors `StartMessage.partial_state`) | ✓ (v0.2) |
+| `:telemetry` events (`[:restate, :invocation, :start \| :stop \| :exception \| :replay_complete \| :journal_mismatch]`) | ✓ (unreleased) |
+| Crash-injection harness (`Restate.Test.CrashInjection.assert_replay_determinism/3`) | ✓ (unreleased) |
+| In-memory test runtime (`Restate.Test.FakeRuntime.run/3`) | ✓ (unreleased) |
+| Request identity verification (Ed25519 JWT, `Restate.RequestIdentity` + `Restate.Plug.RequestIdentity`) | ✓ (unreleased) |
+| Static determinism Credo check (`Restate.Credo.Checks.NonDeterminism`) | ✓ (unreleased) |
 | Full HTTP/2 same-stream suspend/resume | — v0.3 |
+| V7 service protocol (`SuspensionMessage.awaiting_on`, `AwaitingOnMessage`, Future-based suspension) | — v0.3+ |
 
 ## Conformance status
 
@@ -231,6 +239,107 @@ java -jar restate-sdk-test-suite.jar debug \
 - [docs/demo-4-fan-out.md](./docs/demo-4-fan-out.md) — high-concurrency fan-out throughput, two shapes. **Fire-and-forget: 20,000 in-flight Restate invocations on a single elixir-handler pod, +1 MB peak memory over baseline, 2,489 leaves/sec sustained.** **Awakeable-based gather: 1,000 children fanned out + results aggregated in 1.86 s, two HTTP round-trips on the orchestrator side regardless of N.** Per-process generational GC keeps memory delta sublinear in concurrency.
 - [docs/demo-5-sustained-load.md](./docs/demo-5-sustained-load.md) — sustained-load soak. **2,396 `count` invocations + 600 `long_greet` (10 s) at constant 50 RPS for 60 s; P50 stayed in a 1.4 ms window, P99 drift 0.73× (the last bucket was *faster* than the first), peak memory delta +1 MB.** The script parameterises to the PLAN's full 500 RPS × 24 h soak; per-process GC means there is no global sawtooth to find, no matter how long it runs.
 - [docs/java-sdk-comparison.md](./docs/java-sdk-comparison.md) — component-by-component side-by-side against `restatedev/sdk-java`, the canonical port target. The Java state machine is the only pure-language Restate SDK; reading it line by line is the only way to write a faithful Elixir port. This doc records what that read found, including four concrete fix-able gaps the read surfaced (all subsequently landed).
+- [docs/gap-analysis.md](./docs/gap-analysis.md) — working list of remaining gaps vs `sdk-java` plus BEAM-leverage opportunities (telemetry, crash-injection harness, macro-based service definitions, property-tested replay, …) ordered by ROI.
+
+## Telemetry
+
+The runtime emits five [`:telemetry`](https://hexdocs.pm/telemetry) events per invocation. Attach once at app boot and forward to Prometheus / OpenTelemetry / Datadog / Logger:
+
+```elixir
+:telemetry.attach_many(
+  "my-app-restate",
+  [
+    [:restate, :invocation, :start],
+    [:restate, :invocation, :stop],
+    [:restate, :invocation, :exception],
+    [:restate, :invocation, :replay_complete],
+    [:restate, :invocation, :journal_mismatch]
+  ],
+  &MyApp.RestateMetrics.handle_event/4,
+  nil
+)
+```
+
+`:start` / `:stop` are emitted by `:telemetry.span` and carry `service`, `handler`, `outcome` (`:value | :terminal_failure | :error | :suspended | :journal_mismatch`), `response_bytes`, and a wall-clock `duration` in `:native` time units. `:replay_complete` fires once when a resumed invocation catches up to live processing, with the count of replayed commands. `:journal_mismatch` fires on protocol code 570 (handler asked for a command type the recorded journal doesn't have at that index) — surface this on a dashboard; it indicates a deterministic-replay bug. Full event surface and metadata table at `Restate.Telemetry`.
+
+## Authentication
+
+Restate signs requests to the SDK with an Ed25519 JWT carried in `x-restate-signature-scheme: v1` + `x-restate-jwt-v1: <jwt>` headers. The SDK verifies the signature against configured public keys; `restate-server` distributes them as `publickeyv1_<base58>` strings.
+
+`Restate.Plug.RequestIdentity` is auto-installed in the endpoint pipeline. To enable enforcement, set `:request_identity_keys` in the `:restate_server` app environment:
+
+```elixir
+# config/runtime.exs
+if keys = System.get_env("RESTATE_REQUEST_IDENTITY_KEYS") do
+  config :restate_server,
+    request_identity_keys: String.split(keys, ",", trim: true)
+end
+```
+
+Without that config the plug is a no-op (dev / docker-compose loops keep working). When configured, `/invoke/*` requests are verified; `/discover` is intentionally excluded since Restate's discovery probe isn't signed. Multiple keys are supported for rolling rotation: list both old and new keys during cutover. Wire-compatible with the Java SDK's `sdk-request-identity`. See `Restate.RequestIdentity` for the pure verifier API if you need to verify outside a Plug pipeline.
+
+## Offline handler testing
+
+`Restate.Test.FakeRuntime.run/3` drives a handler all the way to its terminal outcome without a live `restate-server`, docker-compose stack, or HTTP listener. Sleep / `ctx.run` / lazy state suspensions auto-complete in-memory; `ctx.call`s use per-target mocks; awakeable / workflow-promise suspensions raise with explanations (v0 scope).
+
+```elixir
+test "Greeter increments and returns" do
+  result = Restate.Test.FakeRuntime.run(
+    {MyApp.Greeter, :greet, 2},
+    %{"name" => "world"},
+    state: %{"counter" => Jason.encode!(2)},
+    call_responses: %{
+      {"OtherService", "compute"} => fn _params -> 42 end
+    }
+  )
+
+  assert result.outcome == :value
+  assert result.value == "hello 3"
+  assert result.state["counter"] == "3"
+end
+```
+
+The result struct (`%Restate.Test.FakeRuntime.Result{}`) carries the terminal outcome, decoded value, derived final state map, full journal transcript, and a `run_completions` map indexed by completion id. `Restate.Test.CrashInjection` (below) uses `FakeRuntime` under the hood to drive baseline runs, so the crash-injection harness now works on any handler shape — not just `ctx.run`-only ones.
+
+## Crash-injection testing
+
+`Restate.Test.CrashInjection.assert_replay_determinism/3` drives your handler all the way through to its terminal outcome (looping through `ctx.run` suspensions by synthesising the runtime's completions from each iteration's `ProposeRunCompletion`), captures the full command journal, then replays against **every prefix** of that journal in two branches:
+
+* **`:without_run_completions`** — the SDK falls back to re-executing any `ctx.run` it encounters, exercising the rare "runtime hasn't acked yet" path.
+* **`:with_run_completions`** — for every `RunCommand` in the prefix, the harness synthesises a `RunCompletionNotificationMessage` carrying the value the function returned in the baseline. The SDK MUST skip the user function and return the recorded value — this is Restate's headline exactly-once guarantee, tested directly.
+
+```elixir
+test "Greeter is replay-deterministic" do
+  Restate.Test.CrashInjection.assert_replay_determinism(
+    {MyApp.Greeter, :greet, 2},
+    %{"name" => "world"}
+  )
+end
+```
+
+Each prefix corresponds to a possible mid-crash state the runtime might persist before re-invoking; the harness asserts the handler either suspends cleanly or matches the baseline outcome and value. The harness leans on BEAM's cheap process spawn — up to `2(n+1)` independent `Invocation` GenServers per call, ~40 µs each. A non-deterministic handler (e.g. one that touches `:erlang.unique_integer/1` *outside* a `ctx.run`) raises with a structured diagnostic that names the failing branch, divergent prefix, expected vs. actual outcome, and decoded reply frame. See `Restate.Test.CrashInjection` for the full API and side-effect-counting semantics.
+
+## Static determinism check
+
+`Restate.Credo.Checks.NonDeterminism` is an opt-in [Credo](https://hex.pm/packages/credo) check that flags non-deterministic function calls in handler modules outside of a `Restate.Context.run/2,3` lambda. Replay determinism is the load-bearing invariant of the SDK; this catches the easy-mode mistakes (`DateTime.utc_now/0`, `:rand.uniform/1`, `:erlang.unique_integer/0`, `make_ref/0`, `System.os_time/0`, `Node.self/0`, …) before they ship.
+
+```elixir
+# .credo.exs
+%{
+  configs: [
+    %{
+      name: "default",
+      checks: %{
+        extra: [
+          {Restate.Credo.Checks.NonDeterminism, []}
+        ]
+      }
+    }
+  ]
+}
+```
+
+Only files that reference `Restate.Context` are scanned, so adding the check to a polyglot Elixir codebase doesn't drown unrelated modules in warnings. Pass `excluded_modules: [MyApp.Helper]` to silence the check on a specific module. Crash-injection covers the runtime side; this covers the static side. See `Restate.Credo.Checks.NonDeterminism` for the full forbidden-MFA list and the documented limitations (helper modules, captured-fn args).
 
 ## License
 
