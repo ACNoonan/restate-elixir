@@ -1,0 +1,30 @@
+# SDK-gap exclusions for the Elixir SDK.
+#
+# These are tests that fail consistently across 1.6.0, 1.6.1, and 1.6.2
+# because the Elixir SDK does not yet implement the feature under test.
+# They are NOT Restate bugs — kept here so the matrix has a stable
+# baseline that surfaces regressions in stuff we *do* support.
+#
+# Restate-side bugs (Cluster B in the baseline notes) and 1.6.2-specific
+# regressions (Cluster C — SleepWithFailures) are intentionally NOT
+# excluded; we want them visible in the matrix so we notice if they
+# stop being Restate-side.
+#
+# Rebuild this file by running the matrix and consolidating the
+# auto-generated test_report/<run>/<version>/exclusions.new.yaml
+# files (intersect them — only tests failing on every targeted
+# version belong here).
+
+exclusions:
+  default:
+    - dev.restate.sdktesting.tests.CallOrdering.ordering
+    - dev.restate.sdktesting.tests.Ingress.headersPassThrough
+    - dev.restate.sdktesting.tests.Ingress.rawHandler
+  singleThreadSinglePartition:
+    - dev.restate.sdktesting.tests.CallOrdering.ordering
+    - dev.restate.sdktesting.tests.Ingress.headersPassThrough
+    - dev.restate.sdktesting.tests.Ingress.rawHandler
+  threeNodes:
+    - dev.restate.sdktesting.tests.CallOrdering.ordering
+    - dev.restate.sdktesting.tests.Ingress.headersPassThrough
+    - dev.restate.sdktesting.tests.Ingress.rawHandler
