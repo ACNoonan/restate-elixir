@@ -52,10 +52,44 @@ end
 user-facing API lives in the `Restate.*` namespace — `Restate.Context`
 for handler ops, `Restate.Awaitable` for combinators,
 `Restate.RetryPolicy` for `ctx.run` retry config,
-`Restate.TerminalError` for business-logic failures. Register
-your handlers via `Restate.Server.Registry.register_service/1`
-from your application's `start/2`. The Bandit endpoint runs on
-port 9080 by default.
+`Restate.TerminalError` for business-logic failures. The Bandit
+endpoint runs on port 9080 by default.
+
+### Define a service
+
+```elixir
+defmodule MyApp.Greeter do
+  use Restate.Service, type: :virtual_object
+  alias Restate.Context
+
+  @handler type: :exclusive
+  def count(%Context{} = ctx, _input) do
+    n = (Context.get_state(ctx, "counter") || 0) + 1
+    Context.set_state(ctx, "counter", n)
+    "hello #{n}"
+  end
+
+  @handler type: :exclusive
+  def long_greet(%Context{} = ctx, name) do
+    Context.sleep(ctx, 10_000)
+    "hello #{name}"
+  end
+end
+```
+
+`use Restate.Service` validates handler signatures (arity 2, public
+`def`) at compile time, generates `__restate_service__/0` for
+discovery, and exposes `__restate_handlers__/0` for reflection.
+Register from your `Application.start/2`:
+
+```elixir
+Restate.Server.Registry.register_service(MyApp.Greeter.__restate_service__())
+```
+
+The plain-function form (no `use Restate.Service`, hand-built
+registration map) is still supported — useful when you need a
+service whose name or handler list is computed at runtime. See
+`Restate.Service` and `Restate.Server.Registry` for details.
 
 ### Run the example handler — docker-compose
 
@@ -155,6 +189,7 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | In-memory test runtime (`Restate.Test.FakeRuntime.run/3`) | ✓ (unreleased) |
 | Request identity verification (Ed25519 JWT, `Restate.RequestIdentity` + `Restate.Plug.RequestIdentity`) | ✓ (unreleased) |
 | Static determinism Credo check (`Restate.Credo.Checks.NonDeterminism`) | ✓ (unreleased) |
+| Macro service definitions (`use Restate.Service` + `@handler`, compile-time arity validation, `__restate_service__/0` reflection) | ✓ (unreleased) |
 | Full HTTP/2 same-stream suspend/resume | — v0.3 |
 | V7 service protocol (`SuspensionMessage.awaiting_on`, `AwaitingOnMessage`, Future-based suspension) | — v0.3+ |
 
