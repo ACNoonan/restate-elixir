@@ -1,4 +1,10 @@
-defmodule Restate.Credo.Checks.NonDeterminism do
+# Compile-only-when-Credo-is-loaded. The SDK declares
+# `{:credo, only: [:dev, :test], runtime: false}` so production
+# releases don't pull it in — and `use Credo.Check` would explode at
+# compile time without this guard. The check is invoked by the user's
+# `mix credo` run in dev/CI, where Credo *is* loaded.
+if Code.ensure_loaded?(Credo.Check) do
+  defmodule Restate.Credo.Checks.NonDeterminism do
   @moduledoc """
   Credo check that flags non-deterministic function calls in handler
   modules outside of a `Restate.Context.run/2` (or `/3`) lambda.
@@ -328,5 +334,6 @@ defmodule Restate.Credo.Checks.NonDeterminism do
       line_no: meta[:line],
       column: meta[:column]
     )
+  end
   end
 end
