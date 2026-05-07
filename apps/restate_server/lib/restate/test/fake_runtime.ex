@@ -314,8 +314,7 @@ defmodule Restate.Test.FakeRuntime do
     Enum.map(frames, & &1.message)
   end
 
-  defp decode_payload(""), do: nil
-  defp decode_payload(bytes) when is_binary(bytes), do: Jason.decode!(bytes)
+  defp decode_payload(bytes) when is_binary(bytes), do: Restate.Serde.decode(bytes)
 
   defp failure_metadata(nil), do: %{}
 
@@ -437,7 +436,7 @@ defmodule Restate.Test.FakeRuntime do
     case Map.fetch(config.call_responses, key) do
       {:ok, fun} when is_function(fun, 1) ->
         value = fun.(cmd.parameter)
-        encoded = Jason.encode!(value)
+        encoded = Restate.Serde.encode(value)
 
         %Pb.CallCompletionNotificationMessage{
           completion_id: cid,
@@ -445,7 +444,7 @@ defmodule Restate.Test.FakeRuntime do
         }
 
       {:ok, value} ->
-        encoded = Jason.encode!(value)
+        encoded = Restate.Serde.encode(value)
 
         %Pb.CallCompletionNotificationMessage{
           completion_id: cid,

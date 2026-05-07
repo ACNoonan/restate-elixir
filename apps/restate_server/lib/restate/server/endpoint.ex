@@ -199,5 +199,5 @@ defmodule Restate.Server.Endpoint do
 
   defp decode_input(nil), do: nil
   defp decode_input(%Pb.Value{content: ""}), do: nil
-  defp decode_input(%Pb.Value{content: bytes}), do: Jason.decode!(bytes)
+  defp decode_input(%Pb.Value{content: bytes}), do: Restate.Serde.decode(bytes)
 end

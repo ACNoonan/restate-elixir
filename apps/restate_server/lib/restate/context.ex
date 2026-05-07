@@ -30,8 +30,9 @@ defmodule Restate.Context do
   @doc """
   Read a state value by string key.
 
-  Returns the JSON-decoded term, or `nil` if no value is stored. Values
-  are JSON-encoded on write (`set_state/3`) and JSON-decoded on read.
+  Returns the term decoded by the configured `Restate.Serde` (default:
+  JSON), or `nil` if no value is stored. The serde used on read must
+  match the one used on the write.
   """
   @spec get_state(t(), binary()) :: term() | nil
   def get_state(%__MODULE__{pid: pid}, key) when is_binary(key) do
@@ -40,7 +41,7 @@ defmodule Restate.Context do
         nil
 
       bytes when is_binary(bytes) ->
-        Jason.decode!(bytes)
+        Restate.Serde.decode(bytes)
 
       {:terminal_error, %Restate.TerminalError{} = exc} ->
         # Cancellation hit during a lazy state fetch — surface to the
@@ -50,11 +51,12 @@ defmodule Restate.Context do
   end
 
   @doc """
-  Write a state value. Any JSON-encodable term is accepted.
+  Write a state value. Any term the configured `Restate.Serde` (default
+  JSON) accepts is allowed.
   """
   @spec set_state(t(), binary(), term()) :: :ok
   def set_state(%__MODULE__{pid: pid}, key, value) when is_binary(key) do
-    GenServer.call(pid, {:set_state, key, Jason.encode!(value)})
+    GenServer.call(pid, {:set_state, key, Restate.Serde.encode(value)})
   end
 
   @doc """
@@ -180,6 +182,11 @@ defmodule Restate.Context do
       h1 = Restate.Context.call_async(ctx, "Counter", "add", 1, key: "k1")
       h2 = Restate.Context.call_async(ctx, "Counter", "add", 2, key: "k2")
       [r1, r2] = Restate.Awaitable.all(ctx, [h1, h2])
+
+  The handle is opaque except for two operations:
+  `Restate.Awaitable.await/2` / `any/2` / `all/2` to consume the
+  result, and `Restate.Awaitable.invocation_id/2` to extract the
+  spawned invocation id (e.g. for `cancel_invocation/2`).
   """
   @spec call_async(t(), String.t(), String.t(), term(), keyword()) ::
           {:call_handle, non_neg_integer(), non_neg_integer()}
@@ -275,14 +282,16 @@ defmodule Restate.Context do
     )
   end
 
-  # JSON-encode the parameter. Elixir strings are binaries, so a naive
-  # binary-passthrough turns `"sign_1abc"` into the wire bytes `sign_1abc`
-  # (unquoted) — which `Jason.decode!` on the receiver chokes on. The
-  # `{:raw, bytes}` opt-out is for callers that already hold pre-encoded
-  # wire bytes (e.g. the Proxy conformance handler forwards opaque
-  # JSON-encoded byte arrays from the test client).
+  # Serde-encode the parameter via the configured `Restate.Serde`
+  # (default: JSON). Elixir strings are binaries, so a naive
+  # binary-passthrough turns `"sign_1abc"` into the wire bytes
+  # `sign_1abc` (unquoted) — which a JSON-shaped receiver chokes on.
+  # The `{:raw, bytes}` opt-out is for callers that already hold
+  # pre-encoded wire bytes (e.g. the Proxy conformance handler
+  # forwards opaque pre-encoded byte arrays from the test client),
+  # and bypasses the serde.
   defp encode_parameter({:raw, bytes}) when is_binary(bytes), do: bytes
-  defp encode_parameter(term), do: Jason.encode!(term)
+  defp encode_parameter(term), do: Restate.Serde.encode(term)
 
   @doc """
   Create an awakeable. Returns `{awakeable_id, handle}` where:

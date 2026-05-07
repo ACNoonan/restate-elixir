@@ -57,7 +57,11 @@ defmodule Restate.Server.MixProject do
       # `Restate.Credo.Checks.NonDeterminism` check can `use Credo.Check`.
       # Users add Credo to their own project to actually run the check;
       # see `Restate.Credo.Checks.NonDeterminism` for the config snippet.
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      # StreamData powers property-based replay-determinism tests
+      # (`apps/restate_server/test/restate/property/replay_determinism_test.exs`).
+      # Test-only.
+      {:stream_data, "~> 1.1", only: [:dev, :test]}
     ]
   end
 
@@ -84,7 +88,7 @@ defmodule Restate.Server.MixProject do
       extras: ["README.md": [title: "README"], "../../CHANGELOG.md": [title: "Changelog"]],
       source_ref: "v#{@version}",
       groups_for_modules: [
-        "User-facing API": [Restate.Context, Restate.Awaitable, Restate.RetryPolicy, Restate.TerminalError, Restate.ProtocolError],
+        "User-facing API": [Restate.Context, Restate.Service, Restate.Awaitable, Restate.RetryPolicy, Restate.TerminalError, Restate.ProtocolError, Restate.Serde, Restate.Serde.Json],
         "Server runtime": [Restate.Server.Application, Restate.Server.Endpoint, Restate.Server.Registry, Restate.Server.DrainCoordinator, Restate.Server.Manifest],
         "Internals": [Restate.Server.Invocation]
       ]

@@ -980,6 +980,225 @@ defmodule Restate.Server.InvocationTest do
     end
   end
 
+  describe "Restate.Awaitable.invocation_id/2" do
+    alias Restate.Awaitable
+
+    defmodule InvocIdReader do
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        handle = Context.call_async(ctx, "Worker", "long", "x", key: "k")
+        id = Awaitable.invocation_id(ctx, handle)
+        %{id: id}
+      end
+    end
+
+    defmodule InvocIdReadTwice do
+      # Reads the id twice on the same handle — second read must hit
+      # the cached notification, not re-suspend or emit duplicates.
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        handle = Context.call_async(ctx, "Worker", "long", "x", key: "k")
+        id1 = Awaitable.invocation_id(ctx, handle)
+        id2 = Awaitable.invocation_id(ctx, handle)
+        %{id1: id1, id2: id2}
+      end
+    end
+
+    defmodule InvocIdThenCancel do
+      # The motivating use case: spawn a call_async, capture its
+      # invocation id, cancel it, then await the call to observe the
+      # cancelled TerminalError. Mirrors what symphony-restate's
+      # operator-cancel path becomes once this SDK function exists.
+      alias Restate.Context
+
+      def handle(ctx, _input) do
+        handle = Context.call_async(ctx, "Worker", "long", "x", key: "k")
+        id = Awaitable.invocation_id(ctx, handle)
+        Context.cancel_invocation(ctx, id)
+
+        try do
+          Awaitable.await(ctx, handle)
+        rescue
+          e in Restate.TerminalError ->
+            %{code: e.code, message: e.message}
+        end
+      end
+    end
+
+    test "first run: emits CallCommand then Suspension on the invocation_id_notification_idx" do
+      # No replay — the call_async records the CallCommand, then
+      # invocation_id/2 suspends on cid_invok (the
+      # invocation_id_notification_idx) waiting for the runtime to
+      # report the spawned id.
+      assert [
+               %Pb.CallCommandMessage{
+                 service_name: "Worker",
+                 handler_name: "long",
+                 key: "k",
+                 invocation_id_notification_idx: cid_invok,
+                 result_completion_id: cid_result
+               },
+               %Pb.SuspensionMessage{
+                 waiting_completions: [cid_susp],
+                 waiting_signals: sigs
+               }
+             ] = run(%Pb.StartMessage{}, nil, {InvocIdReader, :handle, 2})
+
+      assert cid_invok == 1
+      assert cid_result == 2
+      # Suspending on the invocation-id notification (cid 1), NOT the
+      # call's result (cid 2) — that's the whole point: get the id
+      # without paying the call's full round-trip.
+      assert cid_susp == cid_invok
+      # Cancel signal is always part of the suspension's signal list.
+      assert 1 in sigs
+    end
+
+    test "replay with invocation_id notification: returns the id without re-suspending" do
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Worker",
+          handler_name: "long",
+          key: "k",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallInvocationIdCompletionNotificationMessage{
+          completion_id: 1,
+          invocation_id: "inv_callee_xyz"
+        }
+      ]
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {InvocIdReader, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"id" => "inv_callee_xyz"}
+    end
+
+    test "second invocation_id/2 on same handle hits cached notification — no duplicate emits" do
+      # Same journal as the previous test, but the handler reads the
+      # id twice. On the second read the notification is already in
+      # state.notifications from the first read, so we return the
+      # cached value without emitting any extra journal entry. The
+      # only frames on the wire are Output + End.
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Worker",
+          handler_name: "long",
+          key: "k",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallInvocationIdCompletionNotificationMessage{
+          completion_id: 1,
+          invocation_id: "inv_callee_xyz"
+        }
+      ]
+
+      messages = run(%Pb.StartMessage{}, nil, {InvocIdReadTwice, :handle, 2}, replay)
+
+      assert [
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = messages
+
+      assert Jason.decode!(out) == %{
+               "id1" => "inv_callee_xyz",
+               "id2" => "inv_callee_xyz"
+             }
+    end
+
+    test "cancel before id notification arrives: raises 409, no callee SendSignal" do
+      # Journal has the CallCommand recorded but no InvocationId
+      # notification — so we don't know the callee's id. A cancel
+      # signal arriving in this state should raise 409 in the parent
+      # without emitting a SendSignal to a nonexistent target.
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Worker",
+          handler_name: "long",
+          key: "k",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.SignalNotificationMessage{
+          signal_id: {:idx, 1},
+          result: {:void, %Pb.Void{}}
+        }
+      ]
+
+      messages = run(%Pb.StartMessage{}, nil, {InvocIdReader, :handle, 2}, replay)
+
+      # No SendSignalCommandMessage — we have no callee id to target.
+      refute Enum.any?(messages, &match?(%Pb.SendSignalCommandMessage{}, &1))
+
+      assert [
+               %Pb.OutputCommandMessage{
+                 result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+               },
+               %Pb.EndMessage{}
+             ] = messages
+    end
+
+    test "round-trip into cancel_invocation: get id, cancel callee, await sees TerminalError" do
+      # Full happy-path of the motivating workflow on a single replay
+      # pass: the journal carries the spawned id and a failure
+      # notification on the call's result completion. Handler reads
+      # the id, emits SendSignal{idx=1} to it, then awaits the result
+      # and rescues the cancelled TerminalError.
+      replay = [
+        %Pb.CallCommandMessage{
+          service_name: "Worker",
+          handler_name: "long",
+          key: "k",
+          invocation_id_notification_idx: 1,
+          result_completion_id: 2
+        },
+        %Pb.CallInvocationIdCompletionNotificationMessage{
+          completion_id: 1,
+          invocation_id: "inv_callee_xyz"
+        },
+        %Pb.CallCompletionNotificationMessage{
+          completion_id: 2,
+          result: {:failure, %Pb.Failure{code: 409, message: "cancelled"}}
+        }
+      ]
+
+      assert [
+               %Pb.SendSignalCommandMessage{
+                 target_invocation_id: "inv_callee_xyz",
+                 signal_id: {:idx, 1},
+                 result: {:void, %Pb.Void{}}
+               },
+               %Pb.OutputCommandMessage{result: {:value, %Pb.Value{content: out}}},
+               %Pb.EndMessage{}
+             ] = run(%Pb.StartMessage{}, nil, {InvocIdThenCancel, :handle, 2}, replay)
+
+      assert Jason.decode!(out) == %{"code" => 409, "message" => "cancelled"}
+    end
+
+    test "rejects :timer_handle with ArgumentError" do
+      # Pure SDK-side guard — never reaches the GenServer.
+      ctx = %Restate.Context{pid: self()}
+
+      assert_raise ArgumentError, ~r/only accepts :call_handle/, fn ->
+        Awaitable.invocation_id(ctx, {:timer_handle, 1})
+      end
+    end
+
+    test "rejects :awakeable_handle with ArgumentError" do
+      ctx = %Restate.Context{pid: self()}
+
+      assert_raise ArgumentError, ~r/only accepts :call_handle/, fn ->
+        Awaitable.invocation_id(ctx, {:awakeable_handle, 17})
+      end
+    end
+  end
+
   describe "ctx.run with retry policy" do
     defmodule AlwaysSucceeds do
       alias Restate.Context

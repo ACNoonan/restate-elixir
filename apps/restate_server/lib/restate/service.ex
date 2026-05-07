@@ -264,6 +264,39 @@ defmodule Restate.Service do
     service_name = Module.get_attribute(env.module, :restate_service_name)
     service_type = Module.get_attribute(env.module, :restate_service_type)
 
+    caller_funs = build_caller_funs(handlers, service_name)
+
+    caller_block =
+      quote do
+        defmodule Caller do
+          @moduledoc """
+          Compile-time-checked typed call wrappers for `#{unquote(service_name)}`.
+
+          Generated automatically from the `@handler`-annotated `def`s
+          on the parent service module. Calling a non-existent handler
+          through this module is a compile error (the function doesn't
+          exist), instead of a runtime 404 from the runtime.
+
+          Each handler `<name>` gets two wrappers:
+
+            * `<name>(ctx, input, opts \\\\ [])` — synchronous request /
+              reply via `Restate.Context.call/5`. Returns the decoded
+              response, or raises `Restate.TerminalError` if the
+              target raised one.
+
+            * `send_<name>(ctx, input, opts \\\\ [])` — fire-and-forget
+              via `Restate.Context.send_async/5`. Returns `:ok`
+              immediately; the spawned invocation runs independently.
+
+          `opts` are forwarded verbatim to the underlying primitive —
+          `:key` for VirtualObject / Workflow targets, `:idempotency_key`
+          for de-dupe, etc. See `Restate.Context.call/5` and
+          `Restate.Context.send_async/5` for the full option list.
+          """
+          unquote_splicing(caller_funs)
+        end
+      end
+
     quote do
       @doc """
       Service definition for `Restate.Server.Registry.register_service/1`.
@@ -293,6 +326,55 @@ defmodule Restate.Service do
       """
       @spec __restate_handlers__() :: [map()]
       def __restate_handlers__, do: unquote(Macro.escape(handlers))
+
+      unquote(caller_block)
     end
+  end
+
+  # Build the list of `def` AST nodes that go inside the generated
+  # `Caller` submodule. One synchronous wrapper + one fire-and-forget
+  # wrapper per handler. The wrapper's *function* name is the Elixir
+  # function atom (`def count`), which keeps user-facing call sites
+  # idiomatic Elixir snake_case even if the handler's *public* name
+  # was overridden via `@handler name: "publicName"`.
+  defp build_caller_funs(handlers, service_name) do
+    Enum.flat_map(handlers, fn h ->
+      {_mod, fn_atom, _arity} = h.mfa
+      send_atom = String.to_atom("send_" <> Atom.to_string(fn_atom))
+      public_name = h.name
+
+      [
+        quote do
+          @doc """
+          Sync call to `#{unquote(service_name)}.#{unquote(public_name)}`.
+          See `Restate.Context.call/5` for option semantics.
+          """
+          def unquote(fn_atom)(ctx, input, opts \\ []) do
+            Restate.Context.call(
+              ctx,
+              unquote(service_name),
+              unquote(public_name),
+              input,
+              opts
+            )
+          end
+        end,
+        quote do
+          @doc """
+          Fire-and-forget invocation of `#{unquote(service_name)}.#{unquote(public_name)}`.
+          See `Restate.Context.send_async/5` for option semantics.
+          """
+          def unquote(send_atom)(ctx, input, opts \\ []) do
+            Restate.Context.send_async(
+              ctx,
+              unquote(service_name),
+              unquote(public_name),
+              input,
+              opts
+            )
+          end
+        end
+      ]
+    end)
   end
 end

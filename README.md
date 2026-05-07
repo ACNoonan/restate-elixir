@@ -190,6 +190,7 @@ The same demo runs in `docker compose` via `docker compose kill -s SIGKILL elixi
 | Request identity verification (Ed25519 JWT, `Restate.RequestIdentity` + `Restate.Plug.RequestIdentity`) | ✓ (unreleased) |
 | Static determinism Credo check (`Restate.Credo.Checks.NonDeterminism`) | ✓ (unreleased) |
 | Macro service definitions (`use Restate.Service` + `@handler`, compile-time arity validation, `__restate_service__/0` reflection) | ✓ (unreleased) |
+| Pluggable serde (`Restate.Serde` behaviour, `Restate.Serde.Json` default, app-env `:serde` for global swap; `{:raw, bytes}` opt-out preserved) | ✓ (unreleased) |
 | Full HTTP/2 same-stream suspend/resume | — v0.3 |
 | V7 service protocol (`SuspensionMessage.awaiting_on`, `AwaitingOnMessage`, Future-based suspension) | — v0.3+ |
 
@@ -315,6 +316,32 @@ end
 ```
 
 Without that config the plug is a no-op (dev / docker-compose loops keep working). When configured, `/invoke/*` requests are verified; `/discover` is intentionally excluded since Restate's discovery probe isn't signed. Multiple keys are supported for rolling rotation: list both old and new keys during cutover. Wire-compatible with the Java SDK's `sdk-request-identity`. See `Restate.RequestIdentity` for the pure verifier API if you need to verify outside a Plug pipeline.
+
+## Serde
+
+Every SDK-mediated encode / decode site (handler input/output, `set_state` / `get_state`, `ctx.run` results, `ctx.call` parameters, awakeable payloads) flows through `Restate.Serde`. The default impl is `Restate.Serde.Json` — Jason-backed JSON, matching every other Restate SDK on the wire so a polyglot deployment interoperates without per-service negotiation.
+
+To swap the format globally, point the `:serde` key at any module implementing the two-callback `Restate.Serde` behaviour:
+
+```elixir
+# config/config.exs
+config :restate_server, :serde, MyApp.Serde.Msgpack
+```
+
+```elixir
+defmodule MyApp.Serde.Msgpack do
+  @behaviour Restate.Serde
+
+  @impl true
+  def encode(term), do: Msgpax.pack!(term, iodata: false)
+
+  @impl true
+  def decode(""), do: nil
+  def decode(bytes), do: Msgpax.unpack!(bytes)
+end
+```
+
+Two contract requirements: `decode("")` must return `nil` (Restate's "no value" convention — handlers reading absent state expect this), and `encode/1` must be deterministic so `ctx.run` results journal identically across replays. The `{:raw, bytes}` opt-out at every encode site bypasses the configured serde for callers that already hold pre-encoded wire bytes (used by the conformance Proxy handler to forward opaque payloads). The `/discover` manifest is **not** affected — the protocol pins it to JSON regardless of the configured serde.
 
 ## Offline handler testing
 

@@ -224,4 +224,102 @@ defmodule Restate.ServiceTest do
       Restate.Server.Registry.reset()
     end
   end
+
+  describe "Caller submodule (typed call wrappers)" do
+    defmodule TypedCallTarget do
+      use Restate.Service, name: "TypedTarget", type: :virtual_object
+
+      @handler type: :exclusive
+      def add(%Context{} = _ctx, _input), do: :added
+
+      @handler name: "publicReset"
+      def reset(%Context{} = _ctx, _input), do: :reset
+    end
+
+    test "Caller submodule is generated under the parent service" do
+      assert Code.ensure_loaded?(TypedCallTarget.Caller)
+    end
+
+    test "every handler gets a sync wrapper named after the Elixir function" do
+      # `add` was declared as `def add(...)` so the wrapper is
+      # `Caller.add/3`. `reset` was declared as `def reset` with
+      # public name `"publicReset"` — wrapper is still `Caller.reset/3`
+      # (idiomatic Elixir on the call-site side; the public name
+      # only appears in the wire bytes).
+      exports = TypedCallTarget.Caller.__info__(:functions)
+      assert {:add, 3} in exports
+      assert {:add, 2} in exports
+      assert {:reset, 3} in exports
+      assert {:send_add, 3} in exports
+      assert {:send_reset, 3} in exports
+    end
+
+    test "wrapper routes to Restate.Context.call with the public service + handler names" do
+      # Stub a Context whose pid is a process that records the
+      # GenServer.call payload — proves the wrapper forwards the
+      # configured service / public-handler names verbatim.
+      pid = capture_call_payload()
+      ctx = %Restate.Context{pid: pid, key: ""}
+
+      Task.start(fn ->
+        TypedCallTarget.Caller.reset(ctx, %{"some" => "input"}, key: "k1")
+      end)
+
+      payload = receive_payload()
+      assert payload[:service] == "TypedTarget"
+      assert payload[:handler] == "publicReset"
+      assert payload[:key] == "k1"
+    end
+
+    test "send_<handler> routes to Context.send_async (tag :send_async)" do
+      pid = capture_call_payload(:send_async)
+      ctx = %Restate.Context{pid: pid, key: ""}
+
+      Task.start(fn ->
+        TypedCallTarget.Caller.send_add(ctx, 7, key: "k1")
+      end)
+
+      payload = receive_payload()
+      assert payload[:service] == "TypedTarget"
+      assert payload[:handler] == "add"
+      assert payload[:key] == "k1"
+    end
+  end
+
+  # --- helpers --------------------------------------------------------
+
+  # Spawn a tiny GenServer-shaped process that intercepts the very
+  # next `:call` (or other tag) issued through `GenServer.call/3` and
+  # forwards the payload to the test process. Lets us verify what
+  # the typed wrappers send into the Invocation without booting a
+  # real Invocation GenServer.
+  defp capture_call_payload(expected_tag \\ :call) do
+    test_pid = self()
+
+    spawn(fn ->
+      receive do
+        {:"$gen_call", from, {^expected_tag, payload}} ->
+          send(test_pid, {:captured_payload, payload})
+          # Reply something the wrapper accepts so the calling
+          # process doesn't crash unexpectedly. For :call this is
+          # `{:ok, value}`; for :start_send_async it's `:ok`.
+          reply =
+            case expected_tag do
+              :call -> {:ok, "stubbed"}
+              :send_async -> :ok
+              _ -> :ok
+            end
+
+          GenServer.reply(from, reply)
+      end
+    end)
+  end
+
+  defp receive_payload do
+    receive do
+      {:captured_payload, payload} -> payload
+    after
+      500 -> flunk("did not receive a captured payload within 500ms")
+    end
+  end
 end

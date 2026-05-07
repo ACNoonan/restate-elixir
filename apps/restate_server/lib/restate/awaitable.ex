@@ -15,6 +15,12 @@ defmodule Restate.Awaitable do
   that need to compose synchronously-resolved values into an `any/all`
   set without breaking the type.
 
+  Operations on handles:
+
+    * `await/2` / `any/2` / `all/2` — consume the handle's result.
+    * `invocation_id/2` — for `:call_handle` only: return the
+      callee's invocation id (e.g. for `Restate.Context.cancel_invocation/2`).
+
   ## Cancellation semantics
 
   All three primitives respect the V5 cancel signal:
@@ -110,6 +116,47 @@ defmodule Restate.Awaitable do
       {:terminal_error, %Restate.TerminalError{} = exc} ->
         raise exc
     end
+  end
+
+  @doc """
+  Block until the runtime has assigned an invocation id to the
+  callee of a `Restate.Context.call_async/5` and return it.
+
+  The returned id is the same string `Restate.Context.send/5` would
+  hand back synchronously, and is the right value to pass to
+  `Restate.Context.cancel_invocation/2` to cancel the callee
+  out-of-band — typical use is to stash it in
+  `Restate.Context.set_state/3` so a sibling `@Shared` handler can
+  look it up and cancel.
+
+  Costs one round-trip on the
+  `CallInvocationIdCompletionNotificationMessage` (same as
+  `Context.send/5`); on a replay where the notification is already
+  in the journal, returns synchronously without suspending. Repeated
+  calls on the same handle are journal-replay-safe — the cached
+  notification is reused, no duplicate journal entries.
+
+  Only valid on `:call_handle`s. `:timer_handle` and
+  `:awakeable_handle` raise `ArgumentError`: timers and awakeables
+  don't spawn invocations, so there's no id to return.
+
+  Raises `Restate.TerminalError{code: 409, message: "cancelled"}` if
+  the parent invocation gets cancelled while awaiting the id.
+  """
+  @spec invocation_id(Restate.Context.t(), {:call_handle, non_neg_integer(), non_neg_integer()}) ::
+          String.t()
+  def invocation_id(%Restate.Context{pid: pid}, {:call_handle, _result_cid, invok_cid})
+      when is_integer(invok_cid) do
+    case GenServer.call(pid, {:await_invocation_id, invok_cid}, :infinity) do
+      {:ok, id} when is_binary(id) -> id
+      {:terminal_error, %Restate.TerminalError{} = exc} -> raise exc
+    end
+  end
+
+  def invocation_id(%Restate.Context{}, handle) do
+    raise ArgumentError,
+          "Restate.Awaitable.invocation_id/2 only accepts :call_handle handles " <>
+            "from Restate.Context.call_async/5; got: #{inspect(handle)}"
   end
 
   defp unwrap_one({:ok, value}), do: value

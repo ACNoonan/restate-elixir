@@ -58,8 +58,12 @@ defmodule Restate.Example.Fanout do
 
     @handler type: :exclusive
     def run(%Context{} = ctx, %{"size" => n}) when is_integer(n) and n > 0 do
+      # Typed call wrapper from `use Restate.Service`: a typo'd handler
+      # name (e.g. `send_proces/2`) is a compile error here, instead
+      # of a runtime 404 from the runtime when the fan-out actually
+      # fires.
       Enum.each(1..n, fn task_id ->
-        Context.send_async(ctx, "FanoutLeaf", "process", %{"task_id" => task_id})
+        Restate.Example.Fanout.Leaf.Caller.send_process(ctx, %{"task_id" => task_id})
       end)
 
       %{fired: n}
@@ -100,7 +104,7 @@ defmodule Restate.Example.Fanout do
         end)
 
       Enum.each(awakeables, fn {task_id, awakeable_id, _handle} ->
-        Context.send_async(ctx, "FanoutLeaf", "complete", %{
+        Restate.Example.Fanout.Leaf.Caller.send_complete(ctx, %{
           "task_id" => task_id,
           "awakeable_id" => awakeable_id
         })

@@ -812,6 +812,37 @@ defmodule Restate.Server.Invocation do
     do_await_handles(state, mode, handles, from)
   end
 
+  # Surface the callee's invocation id for a deferred call_async handle.
+  # Mirrors `handle_send_invocation_id/3` (the blocking `Context.send/5`
+  # path) — same notification, same wire shape, just exposed via a
+  # different SDK surface so callers who started the call with
+  # `call_async` (no round-trip) can opt into the round-trip later when
+  # they actually need the id (e.g. to cancel the callee out-of-band).
+  #
+  # Replay-safe: on the second call within the same handler, the
+  # CallInvocationIdCompletionNotificationMessage is already in
+  # state.notifications, so we return synchronously without re-suspending.
+  # No new journal entry is emitted either way — this op rides the
+  # CallCommand's existing invocation_id_notification_idx.
+  def handle_call({:await_invocation_id, invok_cid}, from, state) when is_integer(invok_cid) do
+    case Map.fetch(state.notifications, invok_cid) do
+      {:ok, {:invocation_id, id}} when is_binary(id) ->
+        {:reply, {:ok, id}, state}
+
+      :error ->
+        if state.cancelled? do
+          # Notification not yet here, parent cancelled — raise 409.
+          # We can't propagate cancel to the callee because we don't
+          # know its id (that's literally what we're awaiting). The
+          # callee will be torn down by the runtime when it observes
+          # the parent's terminal failure.
+          {:reply, {:terminal_error, cancellation_error()}, state}
+        else
+          suspend(state, invok_cid, from)
+        end
+    end
+  end
+
   def handle_call({:sleep, duration_ms}, from, state) do
     case state.phase do
       :replaying ->
@@ -873,7 +904,7 @@ defmodule Restate.Server.Invocation do
   @impl true
   def handle_info({:handler_result, {:ok, value}}, state) do
     output = %Pb.OutputCommandMessage{
-      result: {:value, %Pb.Value{content: Jason.encode!(value)}}
+      result: {:value, %Pb.Value{content: Restate.Serde.encode(value)}}
     }
 
     finalize(encode_response(state.emitted, [output, %Pb.EndMessage{}]), :value, state)
@@ -1374,16 +1405,16 @@ defmodule Restate.Server.Invocation do
     end
   end
 
-  defp decode_response(""), do: nil
-  defp decode_response(bytes) when is_binary(bytes), do: Jason.decode!(bytes)
+  defp decode_response(bytes) when is_binary(bytes), do: Restate.Serde.decode(bytes)
 
-  # Always JSON-encode the run's return value so it round-trips
-  # through `decode_response/1` on replay. The `{:raw, bytes}` form
-  # is the explicit opt-out for callers who already hold pre-encoded
-  # wire bytes (mirrors the same pattern in `Restate.Context.encode_parameter/1`
-  # and `Proxy.result_to_binary/1`).
+  # Encode the run's return value via the configured `Restate.Serde`
+  # (default JSON) so it round-trips through `decode_response/1` on
+  # replay. The `{:raw, bytes}` form is the explicit opt-out for
+  # callers who already hold pre-encoded wire bytes — bypasses the
+  # serde entirely (mirrors the same pattern in
+  # `Restate.Context.encode_parameter/1` and `Proxy.result_to_binary/1`).
   defp encode_run_value({:raw, bytes}) when is_binary(bytes), do: bytes
-  defp encode_run_value(term), do: Jason.encode!(term)
+  defp encode_run_value(term), do: Restate.Serde.encode(term)
 
   # Awakeable id encoding for V5 / signal-based awakeables.
   #
